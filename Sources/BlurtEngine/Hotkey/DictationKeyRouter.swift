@@ -24,6 +24,12 @@ public struct DictationKeyRouter: Sendable {
     case keyDown(keyCode: Int)
   }
 
+  /// The macOS virtual keycode for the Escape key (`kVK_Escape`). A `keyDown`
+  /// for it discards any live recording — the "bail out, save nothing" gesture —
+  /// rather than being treated as a normal combo. Fixed like the trigger
+  /// keycodes; Escape is never itself a bindable trigger.
+  public static let escapeKeyCode = 53
+
   /// The virtual keycode of the bound trigger modifier (`TriggerKey.keyCode`).
   public private(set) var triggerKeyCode: Int
 
@@ -53,6 +59,10 @@ public struct DictationKeyRouter: Sendable {
       }
       return .none
     case .keyDown(let keyCode):
+      // Escape is the dedicated bail-out: discard a live recording in any state
+      // (see `DictationKeyGate.cancelKey`). Every other non-trigger keyDown is a
+      // possible modifier combo, handled by the gate's tap/hold rules.
+      if keyCode == Self.escapeKeyCode { return gate.cancelKey() }
       return keyCode == triggerKeyCode ? .none : gate.otherKeyDown()
     }
   }

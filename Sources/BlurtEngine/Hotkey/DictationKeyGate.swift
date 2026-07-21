@@ -81,6 +81,24 @@ public struct DictationKeyGate: Sendable {
     }
   }
 
+  /// The dedicated cancel key (Escape) was pressed. Discards any live recording
+  /// — whether `armed` (a push-to-talk in progress) or `latched` (a tap-to-toggle
+  /// recording) — and returns to idle, so the user can abandon a dictation
+  /// mid-flight without it being transcribed or pasted. Unlike `otherKeyDown`,
+  /// which passes through over a latched recording (a genuine shortcut) and only
+  /// cancels a fresh press, Escape always cancels: it isn't a shortcut the user
+  /// could mean for the focused app. A no-op when idle, so a stray Escape outside
+  /// dictation changes nothing here.
+  public mutating func cancelKey() -> Action {
+    switch state {
+    case .idle:
+      return .none
+    case .armed, .latched:
+      state = .idle
+      return .cancel
+    }
+  }
+
   /// Clears state to idle without emitting — used when the event tap is disabled
   /// (timeout / system-initiated) and intervening events may have been missed,
   /// so the held state is no longer trustworthy.

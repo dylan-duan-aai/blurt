@@ -68,6 +68,31 @@ struct DictationKeyRouterTests {
     #expect(router.handle(upEvent(trigger), at: .seconds(2)) == .stop)
   }
 
+  @Test("escape cancels a held recording")
+  func escapeCancelsHeldRecording() {
+    var router = DictationKeyRouter(triggerKeyCode: trigger)
+    #expect(router.handle(downEvent(trigger), at: .zero) == .start)
+    #expect(router.handle(.keyDown(keyCode: DictationKeyRouter.escapeKeyCode), at: .milliseconds(100)) == .cancel)
+  }
+
+  @Test("escape cancels a latched recording (where a plain combo would not)")
+  func escapeCancelsLatchedRecording() {
+    var router = DictationKeyRouter(triggerKeyCode: trigger)
+    #expect(router.handle(downEvent(trigger), at: .zero) == .start)
+    #expect(router.handle(upEvent(trigger), at: .milliseconds(200)) == .none)  // latched
+    // A non-escape combo passes through over a latch; escape still cancels.
+    #expect(router.handle(.keyDown(keyCode: 8), at: .seconds(1)) == .none)  // ⌘C — passes through
+    #expect(router.handle(.keyDown(keyCode: DictationKeyRouter.escapeKeyCode), at: .seconds(2)) == .cancel)
+  }
+
+  @Test("escape while idle does nothing")
+  func escapeWhileIdleIsIgnored() {
+    var router = DictationKeyRouter(triggerKeyCode: trigger)
+    #expect(router.handle(.keyDown(keyCode: DictationKeyRouter.escapeKeyCode), at: .zero) == .none)
+    // And a normal press afterwards still starts a fresh recording.
+    #expect(router.handle(downEvent(trigger), at: .seconds(1)) == .start)
+  }
+
   @Test("a short tap latches; the next tap stops")
   func tapToToggle() {
     var router = DictationKeyRouter(triggerKeyCode: trigger)

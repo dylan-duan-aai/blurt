@@ -227,6 +227,11 @@ final class AppCoordinator {
   /// The record start/stop chimes (see `CueSoundPlayer` below).
   private let cues = CueSoundPlayer()
 
+  /// Pauses the user's music (Apple Music / Spotify) while recording and resumes
+  /// it afterward (see `MediaController`). Like `cues`, driven off the recording
+  /// edge in `render(_:)`.
+  private let media = MediaController()
+
   /// Called when the user changes the sound pack in Settings: reload the cue
   /// players and preview the new voice so the choice is audible immediately.
   func soundPackChanged() {
@@ -251,5 +256,8 @@ final class AppCoordinator {
     menuBarStatus = phase.menuBarStatus
 
     cues.transition(for: phase)
+    // Pause music on the recording edge, resume it when recording ends (a stop,
+    // an Escape-cancel, or a failure). Fire-and-forget off the main thread.
+    media.transition(for: phase)
   }
 }

@@ -10,6 +10,7 @@ struct DictationKeyGateTests {
     case down(Duration)
     case up(Duration)
     case other
+    case escape
     case reset
   }
 
@@ -83,6 +84,30 @@ struct DictationKeyGateTests {
       name: "otherKeyDown while idle is ignored",
       steps: [.init(.other, DictationKeyGate.Action.none), .init(.down(.seconds(1)), .start)]),
     Scenario(
+      name: "escape cancels a push-to-talk recording",
+      steps: [
+        .init(.down(.seconds(0)), .start), .init(.escape, .cancel),
+        // The modifier is still physically held; its eventual up is a no-op now
+        // that the gate is idle, and the next fresh press starts clean.
+        .init(.up(.milliseconds(1200)), DictationKeyGate.Action.none), .init(.down(.seconds(2)), .start),
+      ]),
+    Scenario(
+      name: "escape cancels a latched (tap-to-toggle) recording",
+      steps: [
+        .init(.down(.seconds(0)), .start), .init(.up(.milliseconds(200)), DictationKeyGate.Action.none),
+        .init(.escape, .cancel), .init(.down(.seconds(5)), .start),
+      ]),
+    Scenario(
+      name: "escape while idle is ignored",
+      steps: [.init(.escape, DictationKeyGate.Action.none), .init(.down(.seconds(1)), .start)]),
+    Scenario(
+      name: "escape mid-arming cancels before the tap/hold decision",
+      steps: [
+        .init(.down(.seconds(0)), .start), .init(.escape, .cancel),
+        // A release that would otherwise have latched (short) now does nothing.
+        .init(.up(.milliseconds(200)), DictationKeyGate.Action.none),
+      ]),
+    Scenario(
       name: "modifier up without a prior down is ignored",
       steps: [.init(.up(.seconds(1)), DictationKeyGate.Action.none)]),
     Scenario(
@@ -112,6 +137,7 @@ struct DictationKeyGateTests {
       case .down(let t): action = g.modifierDown(at: t)
       case .up(let t): action = g.modifierUp(at: t)
       case .other: action = g.otherKeyDown()
+      case .escape: action = g.cancelKey()
       case .reset:
         g.reset()
         action = nil

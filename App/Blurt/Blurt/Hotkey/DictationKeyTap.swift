@@ -6,17 +6,20 @@ import os
 ///
 /// Watches `flagsChanged` for the bound modifier (e.g. right ⌘, keycode 54) to
 /// detect down/up, and `keyDown` for any *other* key to spot a modifier combo
-/// (⌘C, ⌘V…). The per-event decision lives in the engine — `DictationKeyRouter`
-/// (keycode relevance + down/up edge dedup) over `DictationKeyGate` (tap/hold
-/// semantics) — so this type only reduces each `CGEvent` to a router event and
-/// owns the tap lifecycle.
+/// (⌘C, ⌘V…) — or an Escape, which the router turns into a cancel that discards
+/// a live recording. The per-event decision lives in the engine —
+/// `DictationKeyRouter` (keycode relevance + down/up edge dedup) over
+/// `DictationKeyGate` (tap/hold semantics) — so this type only reduces each
+/// `CGEvent` to a router event and owns the tap lifecycle.
 ///
 /// Unlike the old chord trigger, this **swallows nothing**: a lone modifier
 /// types nothing into the focused app, and combos must pass through so normal
 /// shortcuts keep working. The tap is therefore created `.listenOnly` — an
 /// active (`.defaultTap`) tap would make macOS synchronously wait on this
 /// process before delivering every keystroke system-wide, so any main-thread
-/// stall in Blurt would add typing latency in *other* apps.
+/// stall in Blurt would add typing latency in *other* apps. A consequence: the
+/// Escape that cancels a recording still reaches the focused app too (it can't
+/// be consumed by a listen-only tap) — harmless in practice.
 ///
 /// Main-actor (via the app target's default isolation) because everything here
 /// already runs on the main thread: the tap's run-loop source is added to the
