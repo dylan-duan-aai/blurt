@@ -1,0 +1,83 @@
+name: build-app
+
+# Builds a runnable Blurt.app on GitHub's macOS runner (which has full Xcode)
+# and uploads it as a downloadable DMG artifact, so a fork can test the app
+# without installing Xcode locally. The build is ad-hoc signed (no Developer ID
+# / notarization needed) — enough to run on Apple Silicon after clearing the
+# download quarantine. It is NOT a release build: not notarized, and TCC grants
+# are keyed to the ad-hoc signature, so permissions must be re-granted after
+# each new build.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "feat/**"
+
+concurrency:
+  group: build-app-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: App/Blurt
+        run: xcodegen generate
+
+      - name: Build Blurt.app (unsigned)
+        working-directory: App/Blurt
+        run: |
+          set -euo pipefail
+          # Debug-Local = real app, no XCUITest/leak hooks (see project.yml).
+          # CODE_SIGNING_ALLOWED=NO: the repo's signing identity is the upstream
+          # maintainer's, absent here — and the post-build /Applications install
+          # step self-skips when signing is disabled.
+          xcodebuild \
+            -project Blurt.xcodeproj \
+            -scheme Blurt \
+            -configuration Debug-Local \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build \
+            clean build \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Ad-hoc sign so it runs on Apple Silicon
+        working-directory: App/Blurt
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Debug-Local/Blurt.app"
+          # Sign nested code first (Debug builds emit unsigned dylibs), then the
+          # bundle — an ad-hoc signature ("-") is enough to execute locally; no
+          # hardened runtime so ad-hoc debug dylibs don't trip library validation.
+          find "$APP" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
+            | while IFS= read -r -d '' f; do codesign --force --sign - "$f"; done
+          codesign --force --sign - "$APP"
+          codesign --verify --deep --verbose=2 "$APP" || true
+
+      - name: Package DMG
+        working-directory: App/Blurt
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Debug-Local/Blurt.app"
+          hdiutil create -volname "Blurt" -srcfolder "$APP" \
+            -ov -format UDZO "$GITHUB_WORKSPACE/Blurt.dmg"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blurt-app-dmg
+          path: Blurt.dmg
+          if-no-files-found: error
