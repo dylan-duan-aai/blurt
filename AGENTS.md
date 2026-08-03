@@ -346,17 +346,24 @@ in-house. Four pieces, three of them pure engine logic:
 - **`TriggerKeyStore`** — persists the chosen keycode in `UserDefaults` (`BlurtTriggerKeyCode`),
   defaulting to **right ⌘**.
 - **`DictationKeyGate`** — pure, clock-free state machine (`idle`/`armed`/`latched`) turning
-  modifier-down/up and other-key-down into `start`/`stop`/`cancel`/`none`. Recording starts the
-  instant the modifier goes down; on key-up a release ≥ `holdThreshold` (default 1 s) is a **hold**
-  (push-to-talk → stop) while a shorter release **latches** (tap-to-toggle; next tap stops). A combo
-  (modifier + another key, e.g. ⌘C) from idle cancels the fresh capture; over a latched recording it
-  passes through as a normal shortcut. Callers pass monotonic timestamps, so every decision is
-  deterministic and unit-tested.
+  modifier-down/up, other-key-down and escape-down into `start`/`stop`/`cancel`/`none`. Recording
+  starts the instant the modifier goes down; on key-up a release ≥ `holdThreshold` (default 1 s) is a
+  **hold** (push-to-talk → stop) while a shorter release **latches** (tap-to-toggle; next tap stops). A
+  combo (modifier + another key, e.g. ⌘C) from idle cancels the fresh capture; over a latched recording
+  it passes through as a normal shortcut. **Escape** (`escapeKeyDown()`) is the unambiguous discard, so
+  unlike a combo it cancels from _every_ live state — held push-to-talk, latched toggle recording, or a
+  re-press over a latch — and always clears state, so a still-held trigger's key-up can't re-`stop` the
+  dictation it just threw away. Callers pass monotonic timestamps, so every decision is deterministic
+  and unit-tested.
 - **`DictationKeyRouter`** — the event-routing layer over the gate: only the bound keycode's flag
   changes drive the modifier, and only genuine down/up **edges** reach the gate (`flagsChanged`
   deliveries re-report the bit whether or not it changed, so a repeat must not double-fire).
   `reset()`/`rebind(triggerKeyCode:)` report whether they discarded a live recording the host must
-  cancel upstream.
+  cancel upstream. It also routes `escapeKeyCode` (53) to the gate's cancel rather than the combo path,
+  and carries **`dictationIsActive`** — set by the host from `!PipelinePhase.isTerminal` — so Escape
+  keeps cancelling across the post-recording transcribe/inject window, which the gate reads as idle.
+  Escape stays inert when nothing is in flight: the tap is listen-only and sees every Escape pressed
+  anywhere on the system, so an idle pipeline must not turn each one into a cancel command.
 
 The app side, **`DictationKeyTap`** (`App/Blurt/Blurt/Hotkey/DictationKeyTap.swift`), reduces each
 `CGEventTap` delivery (watching `flagsChanged` for the bound modifier and `keyDown` for any other
@@ -364,9 +371,13 @@ key) to a `DictationKeyRouter.Event` and owns the tap lifecycle. `AppCoordinator
 `syncAfterTerminalPhase()` on every terminal phase: a dictation can end with no key event to close
 the gate (the auto-release cap, or a refused/failed press), which would leave the gate `.latched`
 and silently swallow the user's next press — a latched `modifierDown` returns `.none`, and the
-`modifierUp` after it returns `.stop`, which no-ops on an already-terminal session. The tap
-**swallows nothing**: a lone modifier types nothing, and combos pass through so normal shortcuts keep
-working.
+`modifierUp` after it returns `.stop`, which no-ops on an already-terminal session. It also pushes
+`dictationIsActive` (`!phase.isTerminal`) down to the tap on every phase, which is what lets Escape
+cancel a dictation that has stopped recording but is still transcribing or pasting. The tap
+**swallows nothing**: a lone modifier types nothing, combos pass through so normal shortcuts keep
+working, and the Escape cancel does **not** consume the keystroke — Escape still reaches the focused
+app. Making it exclusive would require an active (`.defaultTap`) tap, which is ruled out because macOS
+would then block on this process for every system-wide keystroke.
 
 The trigger is editable in the Shortcut section of the setup/settings UI (`HotkeyStepView`) — a
 `Picker` over `TriggerKey.allCases` that writes `TriggerKeyStore`, after which
@@ -411,6 +422,8 @@ Engine-side stores, all `UserDefaults`-backed value types with the same shape:
   `keyTermsProvider`), **`DeveloperModeStore`** (`BlurtDeveloperMode`, off by default),
   **`EnhancedTranscriptsStore`** (`BlurtEnhancedTranscripts`, **on** by default — unset reads as
   enabled; gates the dictation request's `llm` cleanup-rewrite block, re-read at every request),
+  **`SpotifyPauseStore`** (`BlurtPauseSpotifyWhileDictating`, **on** by default — unset reads as
+  enabled; gates the pause-Spotify-while-recording behaviour, re-read on every recording edge),
   **`OverlayOriginStore`** (the pill's dragged origin, x/y), **`LastUpdateCheckStore`**
   (`BlurtLastUpdateCheck`, the stamp throttling the automatic launch update check).
 - **`PersistedSettings.allDefaultsKeys`** is the roster of every key those stores write, and
@@ -427,9 +440,30 @@ Record cues: **`SoundPack`** is a selectable start/stop chime voice (vintage syn
 `id` doubles as the bundled stem `<id>-start.m4a` / `<id>-stop.m4a` under
 `App/Blurt/Blurt/Resources/Sounds/`), listed by **`SoundPackCatalog.swift`**, which is _generated_ by
 `scripts/generate-sounds.swift` alongside the audio. Regenerate both halves together — `check.sh`'s
-sound-catalog guard exists because a drift plays silence with no error. **`RecordingCueGate`** is the
-pure edge detector deciding when the chimes fire; the AppKit `CueSoundPlayer` just plays what it
-resolves.
+sound-catalog guard exists because a drift plays silence with no error. **`RecordingCueGate`** decides
+which chime fires on each recording edge; the AppKit `CueSoundPlayer` just plays what it resolves.
+
+**`RecordingEdgeDetector`** is the shared primitive underneath: a pure detector reporting `.began` on
+the not-recording→recording transition and `.ended` on the reverse, silent everywhere else (the host
+feeds it _every_ phase). `RecordingCueGate` is a thin mapping over it, and so is the Spotify pause —
+they want identical edges, so the edge logic exists once. Note `.ended` fires when the **mic closes**,
+not at a terminal phase: anything suppressed for the microphone's benefit is restored as recording
+stops, not a second later when the paste lands.
+
+Music: **`SpotifyPauseController`** (`App/Blurt/Blurt/`) pauses Spotify while the mic is open and
+resumes it on `.ended`, so the music you're talking over stays out of the transcript. Driven from
+`AppCoordinator.render(_:)` exactly like the chimes. Four things make it safe to have on by default:
+it only ever acts on an **already-running, already-playing** Spotify (the `if application … is running`
+AppleScript idiom deliberately does _not_ launch it); it resumes only if **it** was the one that
+paused, tracked on its serial queue rather than against the setting, so flipping the toggle off
+mid-dictation can't strand the music paused; the Apple Events run on a **serial `DispatchQueue`**, both
+because `NSAppleScript` isn't thread-safe and because a concurrent queue would let a short dictation's
+resume overtake its own pause; and it's entirely fire-and-forget, so a wedged Spotify can never delay a
+recording. Sending Apple Events at all needs **two** build-side pieces, both in `project.yml`:
+`NSAppleEventsUsageDescription` (without it macOS _terminates_ the process on the first send instead of
+prompting) and the `com.apple.security.automation.apple-events` entitlement (the hardened runtime, which
+Blurt ships with, otherwise blocks outgoing events). A user who declines the consent prompt just gets a
+logged `-1743` and an inert feature.
 
 History: **`RecentDictations`** is an in-memory, newest-first ring shown in the ready window (never
 written to disk). **`DictationLog`** appends each completed dictation with its context snapshot to

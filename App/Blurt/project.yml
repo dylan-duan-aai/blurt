@@ -96,12 +96,22 @@ targets:
         LSMinimumSystemVersion: "15.0"
         LSApplicationCategoryType: public.app-category.productivity
         NSMicrophoneUsageDescription: Blurt uses your microphone to transcribe your dictation with AssemblyAI.
+        # Required to send Apple Events at all: without this key macOS terminates
+        # the process on the first send rather than prompting. Shown in the
+        # "Blurt wants to control Spotify" consent dialog, so it must read as a
+        # reason, not a feature name. See SpotifyPauseController.
+        NSAppleEventsUsageDescription: Blurt pauses Spotify while you dictate so the music doesn't end up in your transcript.
     entitlements:
       path: Blurt/Blurt.entitlements
       properties:
         com.apple.security.app-sandbox: false
         com.apple.security.device.audio-input: true
         com.apple.security.network.client: true
+        # The hardened runtime blocks outgoing Apple Events unless the app carries
+        # this exception. Blurt is notarized WITH the hardened runtime (see
+        # release-build.sh), so the entitlement — not just the usage string — is
+        # what makes the Spotify pause work in a shipped build.
+        com.apple.security.automation.apple-events: true
     dependencies:
       - package: BlurtEngine
         product: BlurtEngine

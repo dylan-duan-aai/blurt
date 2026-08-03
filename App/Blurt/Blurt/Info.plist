@@ -24,6 +24,8 @@
 	<string>public.app-category.productivity</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Blurt pauses Spotify while you dictate so the music doesn't end up in your transcript.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Blurt uses your microphone to transcribe your dictation with AssemblyAI.</string>
 </dict>

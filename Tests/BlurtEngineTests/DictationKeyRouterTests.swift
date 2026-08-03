@@ -2,11 +2,13 @@ import Testing
 
 @testable import BlurtEngine
 
-/// The router's two jobs on top of `DictationKeyGate` (whose tap/hold semantics
-/// have their own suites): only the bound keycode's flag *edges* reach the gate
-/// — `flagsChanged` deliveries re-report the bit whether or not it changed, so
-/// a repeat must not double-fire — and reset/rebind report whether they
-/// discarded a live recording the host has to cancel upstream.
+/// The router's jobs on top of `DictationKeyGate` (whose tap/hold semantics have
+/// their own suites): only the bound keycode's flag *edges* reach the gate —
+/// `flagsChanged` deliveries re-report the bit whether or not it changed, so a
+/// repeat must not double-fire — escape routes to a cancel rather than a combo
+/// (including through the transcribe/inject window the gate reads as idle), and
+/// reset/rebind report whether they discarded a live recording the host has to
+/// cancel upstream.
 @Suite("DictationKeyRouter")
 struct DictationKeyRouterTests {
   private let trigger = TriggerKey.rightCommand.keyCode
@@ -19,6 +21,8 @@ struct DictationKeyRouterTests {
   private func upEvent(_ keyCode: Int) -> DictationKeyRouter.Event {
     .flagsChanged(keyCode: keyCode, triggerFlagIsOn: false)
   }
+
+  private let escape = DictationKeyRouter.Event.keyDown(keyCode: DictationKeyRouter.escapeKeyCode)
 
   @Test("a held press is start → stop")
   func holdIsStartStop() {
@@ -75,6 +79,65 @@ struct DictationKeyRouterTests {
     #expect(router.handle(upEvent(trigger), at: .milliseconds(200)) == .none)  // latched
     #expect(router.handle(downEvent(trigger), at: .seconds(5)) == .none)
     #expect(router.handle(upEvent(trigger), at: .seconds(5) + .milliseconds(200)) == .stop)
+  }
+
+  @Test("escape cancels a live recording the gate is tracking")
+  func escapeCancelsRecording() {
+    var router = DictationKeyRouter(triggerKeyCode: trigger)
+    #expect(router.handle(downEvent(trigger), at: .zero) == .start)
+    #expect(router.handle(escape, at: .milliseconds(100)) == .cancel)
+  }
+
+  @Test("escape cancels a latched toggle recording")
+  func escapeCancelsLatchedRecording() {
+    // The gap the feature exists to close: a tap-to-toggle recording is held by
+    // the gate with no key down, and `otherKeyDown` passes through there by
+    // design, so before escape routing nothing short of a second tap ended it.
+    var router = DictationKeyRouter(triggerKeyCode: trigger)
+    #expect(router.handle(downEvent(trigger), at: .zero) == .start)
+    #expect(router.handle(upEvent(trigger), at: .milliseconds(200)) == .none)  // latched
+    #expect(router.handle(escape, at: .seconds(3)) == .cancel)
+    // Cancelling cleared the latch, so the next tap starts a fresh dictation
+    // rather than being swallowed as a stop.
+    #expect(router.handle(downEvent(trigger), at: .seconds(5)) == .start)
+  }
+
+  @Test("escape cancels through the post-recording transcribe/inject window")
+  func escapeCancelsInFlightPipeline() {
+    // A hold that has already stopped leaves the gate idle while the transcript
+    // is still being fetched and pasted. The host reports that window via
+    // `dictationIsActive`, and escape must still cancel inside it — this is the
+    // "Transcribing…" pill the user is looking at when they hit escape.
+    var router = DictationKeyRouter(triggerKeyCode: trigger)
+    #expect(router.handle(downEvent(trigger), at: .zero) == .start)
+    #expect(router.handle(upEvent(trigger), at: .seconds(2)) == .stop)
+    router.dictationIsActive = true
+    #expect(router.handle(escape, at: .seconds(2) + .milliseconds(300)) == .cancel)
+  }
+
+  @Test("escape is inert with nothing in flight")
+  func escapeIsInertWhenIdle() {
+    // The tap is listen-only and sees every escape pressed anywhere on the
+    // system, so an idle pipeline must not turn each one into a cancel command.
+    var router = DictationKeyRouter(triggerKeyCode: trigger)
+    #expect(router.handle(escape, at: .zero) == .none)
+    #expect(router.handle(escape, at: .seconds(1)) == .none)
+    // Still no live dictation reported, even though the gate is idle either way.
+    router.dictationIsActive = false
+    #expect(router.handle(escape, at: .seconds(2)) == .none)
+    // And escape left nothing broken behind — the next press dictates normally.
+    #expect(router.handle(downEvent(trigger), at: .seconds(3)) == .start)
+  }
+
+  @Test("escape is not treated as a combo over a latched recording")
+  func escapeIsNotACombo() {
+    // `keyDown` for an ordinary key over a latch is a pass-through shortcut; the
+    // two routes must not be confused, or ⌘C would cancel (or escape wouldn't).
+    var router = DictationKeyRouter(triggerKeyCode: trigger)
+    #expect(router.handle(downEvent(trigger), at: .zero) == .start)
+    #expect(router.handle(upEvent(trigger), at: .milliseconds(200)) == .none)  // latched
+    #expect(router.handle(.keyDown(keyCode: 8), at: .seconds(1)) == .none)  // ⌘C passes through
+    #expect(router.handle(escape, at: .seconds(2)) == .cancel)
   }
 
   // Note: `reset()`/`rebind(_:)` results are hoisted into locals below because

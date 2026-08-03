@@ -83,15 +83,21 @@ private struct AdvancedSettingsTab: View {
 }
 
 /// The Transcription section of the Settings window: the enhanced-transcripts
-/// switch. While on (the default), every dictation request asks AssemblyAI's
-/// dictation API for its server-side cleanup rewrite, so the pasted text is
-/// the polished version; turned off, the request omits the rewrite and the
-/// verbatim transcript is pasted exactly as spoken. The transcriber reads the
-/// same default this toggle writes at every request, so a change applies to
-/// the next dictation. Settings-only — not a wizard step, since it never
-/// gates setup.
+/// switch and the Spotify pause. While enhanced transcripts is on (the default),
+/// every dictation request asks AssemblyAI's dictation API for its server-side
+/// cleanup rewrite, so the pasted text is the polished version; turned off, the
+/// request omits the rewrite and the verbatim transcript is pasted exactly as
+/// spoken. The transcriber reads the same default this toggle writes at every
+/// request, so a change applies to the next dictation. Both switches are
+/// Settings-only — not wizard steps, since neither gates setup.
+///
+/// The Spotify switch belongs here rather than with the audio cues because it
+/// exists for the transcript's sake: music bleeding into the microphone is what
+/// the recognizer has to compete with. `SpotifyPauseController` reads it on each
+/// recording edge, so a change applies to the next dictation too.
 private struct TranscriptionSection: View {
   @AppStorage(EnhancedTranscriptsStore.defaultsKey) private var enhancedTranscripts = true
+  @AppStorage(SpotifyPauseStore.defaultsKey) private var pauseSpotify = true
 
   var body: some View {
     Section {
@@ -99,12 +105,19 @@ private struct TranscriptionSection: View {
         Label("Enhanced transcripts", systemImage: "wand.and.stars")
       }
       .accessibilityIdentifier(UITestIdentifiers.enhancedTranscriptsToggle)
+      Toggle(isOn: $pauseSpotify) {
+        Label("Pause Spotify while dictating", systemImage: "pause.circle")
+      }
+      .accessibilityIdentifier(UITestIdentifiers.pauseSpotifyToggle)
     } header: {
       Text("Transcription")
     } footer: {
       Text(
         "Polishes each dictation before pasting — removing filler words and fixing punctuation. "
-          + "Turn off to paste your words exactly as spoken.")
+          + "Turn off to paste your words exactly as spoken.\n\n"
+          + "Pausing Spotify keeps the music you're playing out of the recording, and resumes it "
+          + "when you stop. Only applies to Spotify, and only when it's already playing — the "
+          + "first dictation asks your permission to control it.")
     }
   }
 }

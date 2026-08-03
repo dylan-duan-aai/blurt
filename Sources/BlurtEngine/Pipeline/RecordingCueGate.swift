@@ -8,25 +8,27 @@ public enum RecordingCue: Equatable, Sendable {
   case stop
 }
 
-/// Edge-detector deciding when the record start/stop chimes fire. The host calls
+/// Which record cue chime fires on each recording edge. The host calls
 /// `cue(for:)` on *every* pipeline phase, so the gate fires `.start` only on the
 /// idle→recording edge and `.stop` only on the recording→not-recording edge,
 /// staying silent while a phase repeats and across transitions between two
 /// non-recording phases. Value type holding a single edge bit; the host owns one
 /// instance for the app's lifetime.
+///
+/// The edge detection itself is `RecordingEdgeDetector` — shared with the Spotify
+/// pause/resume, which keys off the identical transitions. This type is the chime
+/// half of that: which sound, on which edge.
 public struct RecordingCueGate: Sendable {
-  private var wasRecording = false
+  private var edges = RecordingEdgeDetector()
 
   public init() {}
 
   /// The cue to play for `phase`, or `nil` when the recording edge didn't move.
   public mutating func cue(for phase: PipelinePhase) -> RecordingCue? {
-    let isRecording = phase == .recording
-    defer { wasRecording = isRecording }
-    switch (wasRecording, isRecording) {
-    case (false, true): return .start
-    case (true, false): return .stop
-    default: return nil
+    switch edges.edge(for: phase) {
+    case .began: return .start
+    case .ended: return .stop
+    case nil: return nil
     }
   }
 }

@@ -2,6 +2,7 @@ import Foundation
 
 /// The roster of `UserDefaults` keys the engine's settings stores persist:
 /// trigger key, sound pack, key terms, developer mode, enhanced transcripts,
+/// the Spotify pause switch,
 /// overlay origin, and the
 /// timestamp throttling the automatic update check. Owned
 /// here — next to the stores — so adding a store and adding it to every "reset
@@ -21,6 +22,7 @@ public enum PersistedSettings {
     KeyTermsStore.defaultsKey,
     DeveloperModeStore.defaultsKey,
     EnhancedTranscriptsStore.defaultsKey,
+    SpotifyPauseStore.defaultsKey,
     OverlayOriginStore.xDefaultsKey,
     OverlayOriginStore.yDefaultsKey,
     LastUpdateCheckStore.defaultsKey,
