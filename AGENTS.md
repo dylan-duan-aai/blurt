@@ -474,17 +474,28 @@ processes without system-audio-recording consent — too heavy a permission for 
 MediaRemote (`MRMediaRemoteGetNowPlayingApplicationIsPlaying`) is gated for unentitled apps, returning
 `false` while Spotify was demonstrably playing. Hence the honest split above.
 
-The Apple Events run on a **serial `DispatchQueue`**: `NSAppleScript` isn't thread-safe, and a
-concurrent queue would let a short dictation's restore overtake its own pause. The script execution is
-wrapped in an **`autoreleasepool`** — required, not hygiene: `executeAndReturnError` returns an
-autoreleased descriptor and a Dispatch block drains its pool at an unspecified time, so
-`scripts/leaks.sh` (which scans immediately) once failed on a backtrace through it. The whole thing is
-fire-and-forget, so a wedged player can never delay a recording. Sending Apple Events at all needs
-**two** build-side pieces, both in `project.yml`: `NSAppleEventsUsageDescription` (without it macOS
-_terminates_ the process on the first send instead of prompting) and the
-`com.apple.security.automation.apple-events` entitlement (the hardened runtime, which Blurt ships with,
-otherwise blocks outgoing events). A user who declines the consent prompt just gets a logged `-1743` and
-an inert feature.
+The scripts run in a short-lived **`/usr/bin/osascript` child process**, not in-process
+`NSAppleScript` — and that is a correctness requirement, not a style choice. In-process OSA leaks
+internally per invocation: `scripts/leaks.sh` failed twice on backtraces through
+`executeAndReturnError`, an `autoreleasepool` did **not** help (the second failure's backtrace ran
+straight through the pool), and the leak never reproduced on a dev machine, only on CI — so there was no
+way to validate an in-process fix. Running it in a child makes it structural: the OSA allocations die
+with `osascript`, so no Blurt frame can appear in a leak backtrace. `Process` against a system binary is
+already established here (`SigningIdentity` shells out to `tccutil`). TCC still attributes the event to
+Blurt as the **responsible process**, so the prompt names Blurt and reads its
+`NSAppleEventsUsageDescription`.
+
+One `osascript` per recording edge, not one per player: AppleScript cannot take app-specific terminology
+like `player state` through a variable application reference, so both players are unrolled into one
+generated script, each block wrapped in `try` so an uninstalled app (Spotify on CI) can't abort the
+others. The invocations sit on a **serial `DispatchQueue`** so the restore always observes what the
+pause did — on a concurrent queue a short dictation's restore could overtake its own pause and see
+nothing to resume, leaving the music stopped. The whole thing is fire-and-forget, so a wedged player can
+never delay a recording. Sending Apple Events at all needs **two** build-side pieces, both in
+`project.yml`: `NSAppleEventsUsageDescription` (without it macOS _terminates_ the process on the first
+send instead of prompting) and the `com.apple.security.automation.apple-events` entitlement (the
+hardened runtime, which Blurt ships with, otherwise blocks outgoing events). A user who declines the
+consent prompt just gets a logged `-1743` and an inert feature.
 
 History: **`RecentDictations`** is an in-memory, newest-first ring shown in the ready window (never
 written to disk). **`DictationLog`** appends each completed dictation with its context snapshot to

@@ -25,27 +25,42 @@ import os
 /// 2. **A system play/pause media key** — imprecise, off by default. The only thing
 ///    that reaches a browser playing YouTube, but a stateless toggle: macOS exposes
 ///    no public way to ask whether a browser is playing, so this can *start*
-///    something when nothing was. Gated behind `includesOtherPlayers` so the user
-///    opts into that.
+///    something when nothing was. Gated behind `includesOtherPlayers`.
 ///
-/// The first Apple Event triggers the system's "Blurt wants to control …" consent
-/// prompt, once per target app. Declining surfaces as a logged `-1743` and leaves
-/// the feature inert; nothing in the dictation path depends on it.
+/// ## Why the scripts run in `/usr/bin/osascript` rather than `NSAppleScript`
+///
+/// This began as in-process `NSAppleScript`, and `scripts/leaks.sh` failed on it
+/// twice: the leak backtraces ran through `executeAndReturnError`, so the OSA
+/// machinery leaks internally per invocation. Wrapping the call in an
+/// `autoreleasepool` did **not** fix it — the second failure's backtrace ran
+/// straight *through* the pool — and the leak never reproduced on a dev machine,
+/// only on CI, leaving no way to validate an in-process fix.
+///
+/// Running the script in a short-lived child makes the fix structural instead of
+/// hopeful: the OSA allocations happen inside `osascript` and die with it, so no
+/// Blurt frame can appear in a leak backtrace for this code. `Process` against a
+/// system binary is already established here — `SigningIdentity` shells out to
+/// `tccutil` the same way. TCC still attributes the Apple Event to Blurt as the
+/// *responsible* process, so the consent prompt names Blurt and reads Blurt's
+/// `NSAppleEventsUsageDescription` — don't remove that key.
+///
+/// One `osascript` per edge, not one per player: AppleScript can't take
+/// app-specific terminology like `player state` through a variable application
+/// reference, so both players are unrolled into a single generated script.
 final class MediaPauseController {
   private nonisolated static let logger = Logger(
     subsystem: BlurtIdentity.subsystem, category: "MediaPauseController")
 
-  /// Off-pool home for the Apple Events. A Dispatch queue rather than
+  /// Off-pool home for the `osascript` invocations. A Dispatch queue rather than
   /// `Task.detached`, for the same reason `DictationSession` uses one for the AX
-  /// field-context read: an Apple Event is a *synchronous* cross-process round trip
-  /// bounded only by its timeout, so against a beachballing player it blocks a
-  /// thread outright. The Swift cooperative pool is sized to the core count and
-  /// does not overcommit, so parking its threads here could stall the whole
-  /// non-main runtime — including the dictation actors. Dispatch overcommits, so a
-  /// blocked send costs a thread instead of the pool.
+  /// field-context read: this blocks on a child process which itself blocks on a
+  /// cross-process Apple Event, so against a beachballing player it parks a thread.
+  /// The Swift cooperative pool is sized to the core count and does not overcommit,
+  /// so parking its threads here could stall the whole non-main runtime — including
+  /// the dictation actors. Dispatch overcommits, so a blocked call costs a thread
+  /// instead of the pool.
   ///
-  /// **Serial**, which is load-bearing twice over: `NSAppleScript` is not
-  /// thread-safe, and the restore has to observe what the pause actually did. On a
+  /// **Serial**, so the restore always observes what the pause actually did. On a
   /// concurrent queue a short dictation's restore could overtake its own pause and
   /// see an empty `pausedPlayers` — leaving the music stopped, the one failure the
   /// user would actually notice.
@@ -61,8 +76,7 @@ final class MediaPauseController {
   /// `nonisolated(unsafe)` because it is read and written only inside
   /// `Self.queue.async` blocks, and that queue is serial — so the accesses are
   /// mutually exclusive and ordered without a lock. Do not touch it from the main
-  /// actor; the ordering guarantee is the whole reason it lives here rather than
-  /// beside the edge detector.
+  /// actor; the ordering guarantee is the whole reason it lives here.
   nonisolated(unsafe) private var pausedPlayers: [MediaPlayerApp] = []
 
   /// Whether we sent the imprecise media key and therefore owe a second one. Same
@@ -93,7 +107,7 @@ final class MediaPauseController {
     Self.queue.async { [self] in
       // Assigned, not appended: a stale entry from an earlier dictation whose
       // restore was skipped must not resurrect playback the user has since stopped.
-      pausedPlayers = MediaPlayerApp.allCases.filter { Self.pauseIfPlaying($0) }
+      pausedPlayers = Self.pausePlayingPlayers()
       // Only worth a media key if the precise path found nothing. If Spotify was
       // the thing playing we already handled it exactly, and firing a toggle on top
       // would resume it mid-dictation.
@@ -104,8 +118,10 @@ final class MediaPauseController {
 
   private func restore() {
     Self.queue.async { [self] in
-      for player in pausedPlayers { Self.resume(player) }
-      pausedPlayers = []
+      if !pausedPlayers.isEmpty {
+        Self.resume(pausedPlayers)
+        pausedPlayers = []
+      }
       if sentMediaKey {
         sentMediaKey = false
         Self.postPlayPauseKey()
@@ -113,37 +129,51 @@ final class MediaPauseController {
     }
   }
 
-  /// Pauses `player` only if it is both running and actually playing, reporting
-  /// whether it did. Must be called on `queue`.
-  private nonisolated static func pauseIfPlaying(_ player: MediaPlayerApp) -> Bool {
-    let name = player.applicationName
-    return run(
+  /// Pauses every scriptable player that is running *and* currently playing,
+  /// returning those it paused. Must be called on `queue`.
+  ///
+  /// Each player's block is wrapped in `try` so one uninstalled or unresponsive app
+  /// can't abort the others: on a machine without Spotify, `application "Spotify"`
+  /// raises rather than answering false, which would otherwise skip Apple Music too
+  /// — exactly the CI configuration.
+  private nonisolated static func pausePlayingPlayers() -> [MediaPlayerApp] {
+    let blocks = MediaPlayerApp.allCases.map { player in
       """
-      if application "\(name)" is running then
-        tell application "\(name)"
-          if player state is playing then
-            pause
-            return "\(pausedResult)"
-          end if
-        end tell
-      end if
-      return "no"
-      """) == pausedResult
+      try
+        if application "\(player.applicationName)" is running then
+          tell application "\(player.applicationName)"
+            if player state is playing then
+              pause
+              set out to out & "\(player.rawValue)" & linefeed
+            end if
+          end tell
+        end if
+      end try
+      """
+    }
+    let script = "set out to \"\"\n" + blocks.joined(separator: "\n") + "\nreturn out"
+    guard let output = runOSA(script) else { return [] }
+    // Match back through the raw values rather than trusting order or count, so a
+    // partial failure yields exactly what actually paused.
+    let names = Set(output.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) })
+    return MediaPlayerApp.allCases.filter { names.contains($0.rawValue) }
   }
 
-  /// Resumes `player`, guarded by the same non-launching running check — it may
-  /// have quit during the dictation, and reviving it would be absurd.
-  private nonisolated static func resume(_ player: MediaPlayerApp) {
-    let name = player.applicationName
-    _ = run(
+  /// Resumes the given players, each guarded by the same non-launching running
+  /// check — one may have quit during the dictation, and reviving it would be
+  /// absurd. Must be called on `queue`.
+  private nonisolated static func resume(_ players: [MediaPlayerApp]) {
+    let blocks = players.map { player in
       """
-      if application "\(name)" is running then
-        tell application "\(name)" to play
-      end if
-      """)
+      try
+        if application "\(player.applicationName)" is running then
+          tell application "\(player.applicationName)" to play
+        end if
+      end try
+      """
+    }
+    _ = runOSA(blocks.joined(separator: "\n"))
   }
-
-  private nonisolated static let pausedResult = "paused"
 
   /// Virtual keycode for the system play/pause media key (`NX_KEYTYPE_PLAY`).
   private nonisolated static let playPauseKey: Int = 16
@@ -170,40 +200,41 @@ final class MediaPauseController {
     }
   }
 
-  /// Compiles and runs `source`, returning its string result (nil on any failure).
-  /// Must be called on `queue` — see `pausedPlayers`.
+  /// Runs `source` through `/usr/bin/osascript`, returning trimmed stdout (nil when
+  /// the process couldn't launch or exited non-zero). Must be called on `queue` —
+  /// see `pausedPlayers` — since it blocks until the child exits.
   ///
-  /// Compiled per call rather than cached: this runs a handful of times per
-  /// dictation on a background queue, so the OSA compile is far too cheap to
-  /// justify holding more mutable, queue-confined state.
-  ///
-  /// The **`autoreleasepool` is required, not hygiene**: `executeAndReturnError`
-  /// returns an autoreleased descriptor, and a `DispatchQueue` block drains its
-  /// pool at an unspecified time rather than at block exit. `scripts/leaks.sh`
-  /// scans the process the instant after exercising the dictation path, so an
-  /// undrained descriptor is indistinguishable from a leak and failed that gate
-  /// with a backtrace through this function. Draining here makes the lifetime
-  /// deterministic.
-  private nonisolated static func run(_ source: String) -> String? {
-    autoreleasepool {
-      guard let script = NSAppleScript(source: source) else {
-        logger.error("failed to build media script")
-        return nil
-      }
-      var error: NSDictionary?
-      let result = script.executeAndReturnError(&error)
-      if let error {
-        // -1743 is "not authorized to send Apple events", i.e. the user declined
-        // the automation prompt. Logged rather than surfaced: the dictation itself
-        // worked, and a modal about the user's music player would be worse than
-        // silent.
-        let code = error[NSAppleScript.errorNumber] as? Int ?? 0
-        logger.error("media script failed (\(code, privacy: .public))")
-        return nil
-      }
-      // Safe to hand out across the drain: the bridged `String` retains its own
-      // storage rather than borrowing the descriptor's.
-      return result.stringValue
+  /// stderr goes to a pipe rather than being inherited, so a script error (a
+  /// declined automation prompt reports `-1743` here) can't spray the app's own
+  /// output; and both pipes are drained *before* `waitUntilExit` so a chatty script
+  /// can't deadlock against a full pipe buffer.
+  private nonisolated static func runOSA(_ source: String) -> String? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    process.arguments = ["-e", source]
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.standardOutput = stdout
+    process.standardError = stderr
+    do {
+      try process.run()
+    } catch {
+      logger.error("osascript failed to launch: \(error.localizedDescription, privacy: .public)")
+      return nil
     }
+    let data = stdout.fileHandleForReading.readDataToEndOfFile()
+    let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+      // Logged, not surfaced: the dictation itself worked, and a modal about the
+      // user's music player would be worse than silent. `-1743` here means the user
+      // declined the automation prompt.
+      let message =
+        String(bytes: errorData, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      logger.error("osascript exited \(process.terminationStatus): \(message, privacy: .public)")
+      return nil
+    }
+    return String(bytes: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 }
