@@ -15,7 +15,7 @@ public enum RecordingEdge: Equatable, Sendable {
 /// instance for the app's lifetime.
 ///
 /// Extracted from `RecordingCueGate`, which is now a thin mapping over it: the
-/// chimes and the Spotify pause/resume want the identical edges and had no
+/// chimes and the media pause/resume want the identical edges and had no
 /// business each re-deriving them. Note `.ended` fires when the *mic* stops, not
 /// when the dictation reaches a terminal phase — the transcribe/inject tail is no
 /// longer recording, so anything suppressed for the microphone's benefit should

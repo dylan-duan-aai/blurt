@@ -91,13 +91,20 @@ private struct AdvancedSettingsTab: View {
 /// request, so a change applies to the next dictation. Both switches are
 /// Settings-only — not wizard steps, since neither gates setup.
 ///
-/// The Spotify switch belongs here rather than with the audio cues because it
-/// exists for the transcript's sake: music bleeding into the microphone is what
-/// the recognizer has to compete with. `SpotifyPauseController` reads it on each
+/// The music switches belong here rather than with the audio cues because they
+/// exist for the transcript's sake: music bleeding into the microphone is what the
+/// recognizer has to compete with. `MediaPauseController` reads them on each
 /// recording edge, so a change applies to the next dictation too.
+///
+/// The second switch is nested under the first and defaults **off** on purpose. It
+/// sends a system media key, which is the only thing that reaches a browser — but
+/// it's a blind toggle, so it can start playback when nothing was playing. That
+/// trade-off is the user's to make, so the copy says so plainly instead of hiding
+/// it.
 private struct TranscriptionSection: View {
   @AppStorage(EnhancedTranscriptsStore.defaultsKey) private var enhancedTranscripts = true
-  @AppStorage(SpotifyPauseStore.defaultsKey) private var pauseSpotify = true
+  @AppStorage(MediaPauseStore.defaultsKey) private var pauseMedia = true
+  @AppStorage(MediaPauseStore.otherPlayersDefaultsKey) private var pauseOtherMedia = false
 
   var body: some View {
     Section {
@@ -105,19 +112,30 @@ private struct TranscriptionSection: View {
         Label("Enhanced transcripts", systemImage: "wand.and.stars")
       }
       .accessibilityIdentifier(UITestIdentifiers.enhancedTranscriptsToggle)
-      Toggle(isOn: $pauseSpotify) {
-        Label("Pause Spotify while dictating", systemImage: "pause.circle")
+      Toggle(isOn: $pauseMedia) {
+        Label("Pause music while dictating", systemImage: "pause.circle")
       }
-      .accessibilityIdentifier(UITestIdentifiers.pauseSpotifyToggle)
+      .accessibilityIdentifier(UITestIdentifiers.pauseMediaToggle)
+      Toggle(isOn: $pauseOtherMedia) {
+        Label("Also pause browsers and other players", systemImage: "globe")
+      }
+      .accessibilityIdentifier(UITestIdentifiers.pauseOtherMediaToggle)
+      // Meaningless on its own — the media key only ever fires as part of the
+      // pause, so disabling it with the parent keeps the UI honest.
+      .disabled(!pauseMedia)
+      .padding(.leading, 20)
     } header: {
       Text("Transcription")
     } footer: {
       Text(
         "Polishes each dictation before pasting — removing filler words and fixing punctuation. "
           + "Turn off to paste your words exactly as spoken.\n\n"
-          + "Pausing Spotify keeps the music you're playing out of the recording, and resumes it "
-          + "when you stop. Only applies to Spotify, and only when it's already playing — the "
-          + "first dictation asks your permission to control it.")
+          + "Pausing music keeps what you're listening to out of the recording, and resumes it "
+          + "when you stop. Spotify and Music are paused only when already playing — the first "
+          + "dictation asks your permission to control them.\n\n"
+          + "Browsers can't report whether they're playing, so the second option sends a "
+          + "play/pause key instead. It reaches YouTube and other players, but because it's a "
+          + "blind toggle it can occasionally start something that wasn't playing.")
     }
   }
 }

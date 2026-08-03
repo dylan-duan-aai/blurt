@@ -205,10 +205,10 @@ final class AppCoordinator {
   /// The record start/stop chimes (see `CueSoundPlayer` below).
   private let cues = CueSoundPlayer()
 
-  /// Pauses Spotify for the duration of a recording so the music doesn't land in
-  /// the microphone feed (see `SpotifyPauseController`). Keyed off the same
-  /// recording edges as the chimes.
-  private let spotify = SpotifyPauseController()
+  /// Quiets the user's music for the duration of a recording so it doesn't land in
+  /// the microphone feed (see `MediaPauseController`). Keyed off the same recording
+  /// edges as the chimes.
+  private let media = MediaPauseController()
 
   /// Called when the user changes the sound pack in Settings: reload the cue
   /// players and preview the new voice so the choice is audible immediately.
@@ -235,10 +235,10 @@ final class AppCoordinator {
     menuBarStatus = phase.menuBarStatus
 
     cues.transition(for: phase)
-    // Same recording edges as the chimes: silence Spotify while the mic is open,
+    // Same recording edges as the chimes: quiet the music while the mic is open,
     // give it back the moment the mic closes. Fire-and-forget — nothing in the
     // dictation path waits on another app.
-    spotify.transition(for: phase)
+    media.transition(for: phase)
 
     // Tell the tap whether a dictation is still in flight, so Escape keeps
     // cancelling after recording has stopped — through the transcribe/inject

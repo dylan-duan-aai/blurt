@@ -422,8 +422,9 @@ Engine-side stores, all `UserDefaults`-backed value types with the same shape:
   `keyTermsProvider`), **`DeveloperModeStore`** (`BlurtDeveloperMode`, off by default),
   **`EnhancedTranscriptsStore`** (`BlurtEnhancedTranscripts`, **on** by default — unset reads as
   enabled; gates the dictation request's `llm` cleanup-rewrite block, re-read at every request),
-  **`SpotifyPauseStore`** (`BlurtPauseSpotifyWhileDictating`, **on** by default — unset reads as
-  enabled; gates the pause-Spotify-while-recording behaviour, re-read on every recording edge),
+  **`MediaPauseStore`** (two keys: `BlurtPauseMediaWhileDictating`, **on** by default — unset reads as
+  enabled; and `BlurtPauseOtherMediaWhileDictating`, **off** by default — the plain `bool(forKey:)`
+  shape, because that switch can misfire. Both re-read on every recording edge),
   **`OverlayOriginStore`** (the pill's dragged origin, x/y), **`LastUpdateCheckStore`**
   (`BlurtLastUpdateCheck`, the stamp throttling the automatic launch update check).
 - **`PersistedSettings.allDefaultsKeys`** is the roster of every key those stores write, and
@@ -445,25 +446,45 @@ which chime fires on each recording edge; the AppKit `CueSoundPlayer` just plays
 
 **`RecordingEdgeDetector`** is the shared primitive underneath: a pure detector reporting `.began` on
 the not-recording→recording transition and `.ended` on the reverse, silent everywhere else (the host
-feeds it _every_ phase). `RecordingCueGate` is a thin mapping over it, and so is the Spotify pause —
+feeds it _every_ phase). `RecordingCueGate` is a thin mapping over it, and so is the media pause —
 they want identical edges, so the edge logic exists once. Note `.ended` fires when the **mic closes**,
 not at a terminal phase: anything suppressed for the microphone's benefit is restored as recording
 stops, not a second later when the paste lands.
 
-Music: **`SpotifyPauseController`** (`App/Blurt/Blurt/`) pauses Spotify while the mic is open and
-resumes it on `.ended`, so the music you're talking over stays out of the transcript. Driven from
-`AppCoordinator.render(_:)` exactly like the chimes. Four things make it safe to have on by default:
-it only ever acts on an **already-running, already-playing** Spotify (the `if application … is running`
-AppleScript idiom deliberately does _not_ launch it); it resumes only if **it** was the one that
-paused, tracked on its serial queue rather than against the setting, so flipping the toggle off
-mid-dictation can't strand the music paused; the Apple Events run on a **serial `DispatchQueue`**, both
-because `NSAppleScript` isn't thread-safe and because a concurrent queue would let a short dictation's
-resume overtake its own pause; and it's entirely fire-and-forget, so a wedged Spotify can never delay a
-recording. Sending Apple Events at all needs **two** build-side pieces, both in `project.yml`:
-`NSAppleEventsUsageDescription` (without it macOS _terminates_ the process on the first send instead of
-prompting) and the `com.apple.security.automation.apple-events` entitlement (the hardened runtime, which
-Blurt ships with, otherwise blocks outgoing events). A user who declines the consent prompt just gets a
-logged `-1743` and an inert feature.
+Music: **`MediaPauseController`** (`App/Blurt/Blurt/`) quiets the user's music while the mic is open
+and restores it on `.ended`, so what you're listening to stays out of the transcript. Driven from
+`AppCoordinator.render(_:)` exactly like the chimes. **Two mechanisms, deliberately unequal:**
+
+1. **Scriptable players** — `MediaPlayerApp` (Spotify, Apple Music), on by default. Both expose
+   `player state` over one shared script shape, so we pause only a player that is _already playing_ and
+   resume only what we paused (tracked on the controller's serial queue, not against the setting, so
+   flipping the toggle off mid-dictation can't strand the music paused). `if application … is running`
+   is the idiom that reads the running state _without_ launching the app — a dictation must never boot a
+   music player. Because it cannot start anything unbidden, it's safe on by default.
+2. **A system play/pause media key** — off by default. The only thing that reaches a browser playing
+   YouTube, but a stateless toggle, so with nothing actually playing it can _start_ a player. Only
+   fires when the precise path found nothing (if Spotify was playing we already handled it exactly, and
+   a toggle on top would resume it mid-dictation).
+
+**Why there is no state-aware option for browsers** — all three alternatives were measured and rejected,
+so don't re-litigate this without new evidence: CoreAudio's device-level
+`kAudioDevicePropertyDeviceIsRunningSomewhere` reads busy even in total silence with the app quit;
+per-process `kAudioProcessPropertyIsRunningOutput` (public, macOS 14.4+) reports nothing for other
+processes without system-audio-recording consent — too heavy a permission for pausing music; and
+MediaRemote (`MRMediaRemoteGetNowPlayingApplicationIsPlaying`) is gated for unentitled apps, returning
+`false` while Spotify was demonstrably playing. Hence the honest split above.
+
+The Apple Events run on a **serial `DispatchQueue`**: `NSAppleScript` isn't thread-safe, and a
+concurrent queue would let a short dictation's restore overtake its own pause. The script execution is
+wrapped in an **`autoreleasepool`** — required, not hygiene: `executeAndReturnError` returns an
+autoreleased descriptor and a Dispatch block drains its pool at an unspecified time, so
+`scripts/leaks.sh` (which scans immediately) once failed on a backtrace through it. The whole thing is
+fire-and-forget, so a wedged player can never delay a recording. Sending Apple Events at all needs
+**two** build-side pieces, both in `project.yml`: `NSAppleEventsUsageDescription` (without it macOS
+_terminates_ the process on the first send instead of prompting) and the
+`com.apple.security.automation.apple-events` entitlement (the hardened runtime, which Blurt ships with,
+otherwise blocks outgoing events). A user who declines the consent prompt just gets a logged `-1743` and
+an inert feature.
 
 History: **`RecentDictations`** is an in-memory, newest-first ring shown in the ready window (never
 written to disk). **`DictationLog`** appends each completed dictation with its context snapshot to

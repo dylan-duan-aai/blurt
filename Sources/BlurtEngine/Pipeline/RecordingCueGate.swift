@@ -15,7 +15,7 @@ public enum RecordingCue: Equatable, Sendable {
 /// non-recording phases. Value type holding a single edge bit; the host owns one
 /// instance for the app's lifetime.
 ///
-/// The edge detection itself is `RecordingEdgeDetector` — shared with the Spotify
+/// The edge detection itself is `RecordingEdgeDetector` — shared with the media
 /// pause/resume, which keys off the identical transitions. This type is the chime
 /// half of that: which sound, on which edge.
 public struct RecordingCueGate: Sendable {
