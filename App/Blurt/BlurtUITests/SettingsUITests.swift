@@ -106,6 +106,33 @@ final class SettingsUITests: BlurtUITestCase {
     XCTAssertEqual("\(toggle.value ?? "")", "1", "Clicking should switch developer mode on")
   }
 
+  /// The two media-pause switches, whose defaults are deliberately opposite: the
+  /// precise scripted pause is on (it can't start anything unbidden), while the
+  /// media-key fallback is off (a blind toggle that can start playback that wasn't
+  /// running). Pinning both here means an accidental flip of either default — the
+  /// second especially — fails a test rather than shipping.
+  ///
+  /// Matched by identifier rather than element type, like the developer toggle, so
+  /// the test doesn't care whether AppKit exposes a SwiftUI switch as a switch or a
+  /// checkbox.
+  func testMediaPauseTogglesHaveOppositeDefaults() {
+    let settings = openSettingsWindow()
+    let advanced = selectSettingsTab(settings, named: UITestIdentifiers.advancedSettingsTab)
+
+    let pauseMedia = advanced.anyDescendant(identified: UITestIdentifiers.pauseMediaToggle)
+    XCTAssertTrue(pauseMedia.waitForExistence(timeout: 10), "Pause-music toggle not found")
+    XCTAssertEqual("\(pauseMedia.value ?? "")", "1", "Pausing music should default ON")
+
+    let pauseOther = advanced.anyDescendant(identified: UITestIdentifiers.pauseOtherMediaToggle)
+    XCTAssertTrue(pauseOther.waitForExistence(timeout: 10), "Pause-other-players toggle not found")
+    XCTAssertEqual(
+      "\(pauseOther.value ?? "")", "0",
+      "The imprecise media-key fallback must default OFF — it can start playback that wasn't running")
+
+    pauseOther.click()
+    XCTAssertEqual("\(pauseOther.value ?? "")", "1", "Clicking should opt into the fallback")
+  }
+
   /// The Advanced pane's "Check for Updates" button runs the check and reports
   /// the result in a modal. Under UI testing the check is stubbed offline to
   /// always report up-to-date, so clicking it surfaces the "You’re up to date"
