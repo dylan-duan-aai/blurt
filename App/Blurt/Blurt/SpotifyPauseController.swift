@@ -122,22 +122,35 @@ final class SpotifyPauseController {
   /// Compiled per call rather than cached: this runs twice per dictation on a
   /// background queue, so the OSA compile is far too cheap to justify holding
   /// more mutable, queue-confined state.
+  ///
+  /// The **`autoreleasepool` is required, not hygiene**: `executeAndReturnError`
+  /// returns an autoreleased descriptor, and a `DispatchQueue` block drains its
+  /// pool at an unspecified time rather than at block exit. `scripts/leaks.sh`
+  /// scans the process the instant after exercising the dictation path, so an
+  /// undrained descriptor is indistinguishable from a leak and failed the gate
+  /// with a backtrace through this function. Draining here makes the lifetime
+  /// deterministic — and keeps the transient OSA allocations from outliving a
+  /// dictation regardless.
   private nonisolated static func run(_ source: String) -> String? {
-    guard let script = NSAppleScript(source: source) else {
-      logger.error("failed to build Spotify script")
-      return nil
+    autoreleasepool {
+      guard let script = NSAppleScript(source: source) else {
+        logger.error("failed to build Spotify script")
+        return nil
+      }
+      var error: NSDictionary?
+      let result = script.executeAndReturnError(&error)
+      if let error {
+        // -1743 is "not authorized to send Apple events", i.e. the user declined
+        // the automation prompt (or hasn't been asked yet and the app is not
+        // permitted). Logged rather than surfaced: the dictation itself worked, and
+        // a modal about the user's music player would be worse than silent.
+        let code = error[NSAppleScript.errorNumber] as? Int ?? 0
+        logger.error("Spotify script failed (\(code, privacy: .public))")
+        return nil
+      }
+      // Safe to hand out across the drain: the bridged `String` retains its own
+      // storage rather than borrowing the descriptor's.
+      return result.stringValue
     }
-    var error: NSDictionary?
-    let result = script.executeAndReturnError(&error)
-    if let error {
-      // -1743 is "not authorized to send Apple events", i.e. the user declined
-      // the automation prompt (or hasn't been asked yet and the app is not
-      // permitted). Logged rather than surfaced: the dictation itself worked, and
-      // a modal about the user's music player would be worse than silent.
-      let code = error[NSAppleScript.errorNumber] as? Int ?? 0
-      logger.error("Spotify script failed (\(code, privacy: .public))")
-      return nil
-    }
-    return result.stringValue
   }
 }
