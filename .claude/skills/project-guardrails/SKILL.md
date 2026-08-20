@@ -10,6 +10,18 @@ These are settled decisions. Don't reintroduce them; if a task seems to require
 one, stop and ask the user first. This is the fast "don't" list; AGENTS.md's
 "Settled decisions" table is the fuller reference and the source of truth.
 
+Many of these are also enforced mechanically — `scripts/check-invariants.sh`
+(run by `check.sh`, including `--portable`) greps for the constructs that give
+each one away, so reintroducing one fails the health check rather than depending
+on this list being read. Those rules also pin a verbatim slice of the bullet
+they come from in this file, so rewording or deleting one fails the gate until
+someone decides whether the rule survives the edit — edit these entries
+knowing that, and fix the anchor in the same change. Treat that as a backstop, not the boundary: the rules
+it can't express are still here, still binding, and the reasons in this file are
+what let you tell an intended exception from a mistake. Never silence a finding
+with `// invariant-ok:` to get a build green — that marker is for a line that is
+genuinely correct, and reaching for it means it's time to stop and ask.
+
 ## Audio
 
 - **No `AVAudioEngine` / `installTap` capture path.** `MicCapture` uses
@@ -23,15 +35,37 @@ one, stop and ask the user first. This is the fast "don't" list; AGENTS.md's
 
 - **No streaming STT.** The AssemblyAI Sync API returns the full transcript in
   one response. Overlay goes "Transcribing…" → full text.
-- **No separate LLM cleanup pass.** Cleanup rides in the Sync STT request's
-  `config.prompt` (`TranscriptionPrompt`). No LLM Gateway client, no
-  `StylerProtocol`, no post-transcription styling stage.
+- **No separate LLM cleanup pass.** Cleanup rides in the same dictation request,
+  as the `llm` block's `instruction` (`CleanupInstruction`). No LLM Gateway
+  client, no `StylerProtocol`, no post-transcription styling stage.
 - **No local models / model downloads.** Transcription is a remote AssemblyAI
   call. No on-device ASR/LLM, no model cache, no download UI.
-- Don't reintroduce a "remove filler words (um, uh, like)" directive in the
-  prompt — `universal-3-5-pro` ignores it; it was deliberately dropped. Same for
-  a language directive: pinning the prompt to English hurt non-English speech, so
-  language is left to the model's own detection.
+- **There is no `config.prompt`.** `config.conversation_context`
+  (`ConversationContext.turns`) replaced it. Don't add a prompt back: a custom one
+  replaces the service's managed default _and_ makes the API ignore
+  `config.language_code`.
+- **The context turns carry the recent dictations + the prior chunk, and nothing
+  else.** `ConversationContext.turns` reads exactly two fields of
+  `TranscriptionContext` (`recentTranscripts`, then `priorText` last). The app
+  name, window title, field label and selected text are captured for the paste
+  path and the developer-mode log and stay on the machine; the hints that used to
+  carry them were deleted, not gated. Don't widen the context back out, and don't
+  route that context onto the request by another path.
+- **Key terms are word boosting, not context text.** They ride
+  `config.word_boost` as a flat array of strings (`KeytermsBoost`), fitted to that
+  field's own 2048-character cap. Don't fold them back into the context as a
+  `Keywords: a, b, c.` clause, and don't also send `keyterms_prompt` — the aliases
+  are mutually exclusive, and `word_boost` is the name the dictation API's
+  reference documents.
+- Don't reintroduce a "remove filler words (um, uh, like)" directive —
+  `universal-3-5-pro` ignores it; it was deliberately dropped, and there is no
+  prompt field to put it in now.
+- **Don't set a language — not a directive, and not `config.language_code`.**
+  Pinning transcription to English hurt non-English speech. The API documents
+  `language_code` as defaulting to `en`, but detection was measured to work with
+  no language field and no prompt (Spanish, French, German and Japanese clips each
+  came back in their own language). Adding one removes working detection;
+  `KeytermsWireTests` asserts the config carries no language key.
 - **Injection is always a clipboard paste** (save → write → ⌘V → settle →
   restore), degrading to "left it on the clipboard" when the target is lost. No
   keystroke-by-keystroke typing path, no length threshold.
@@ -63,7 +97,7 @@ one, stop and ask the user first. This is the fast "don't" list; AGENTS.md's
   generated from `project.yml`; edit that and run `xcodegen generate`. check.sh
   fails on pbxproj drift (a PreToolUse hook also blocks edits to it).
 - The engine has **no external SPM dependencies** (Foundation/Security/
-  AVFoundation only). Don't add one to `Sources/BlurtEngine/`.
+  AVFoundation/CoreAudio only). Don't add one to `Sources/BlurtEngine/`.
 - Unit tests use **Swift Testing**, not XCTest (the `BlurtUITests` XCUITest
   bundle is the one exception — XCUIAutomation requires XCTest). **Never touch
   the real Keychain in tests** — `APIKeyStore` is the production item; use an

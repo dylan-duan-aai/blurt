@@ -106,6 +106,28 @@ final class SettingsUITests: BlurtUITestCase {
     XCTAssertEqual("\(toggle.value ?? "")", "1", "Clicking should switch developer mode on")
   }
 
+  /// The media-pause switch defaults **on**, which is only safe because the scripted
+  /// path can't start playback that wasn't already running — so the default and that
+  /// property travel together. Pinning it here means flipping it, or widening the
+  /// feature to something that *can* start playback while leaving the default on,
+  /// fails a test rather than shipping.
+  ///
+  /// Matched by identifier rather than element type, like the developer toggle, so
+  /// the test doesn't care whether AppKit exposes a SwiftUI switch as a switch or a
+  /// checkbox.
+  func testMediaPauseDefaultsOnAndToggles() {
+    let settings = openSettingsWindow()
+    let advanced = selectSettingsTab(settings, named: UITestIdentifiers.advancedSettingsTab)
+
+    let toggle = advanced.anyDescendant(identified: UITestIdentifiers.pauseMediaToggle)
+    XCTAssertTrue(toggle.waitForExistence(timeout: 10), "Pause-music toggle not found")
+    XCTAssertEqual("\(toggle.value ?? "")", "1", "Pausing music should default ON")
+
+    toggle.click()
+
+    XCTAssertEqual("\(toggle.value ?? "")", "0", "Clicking should opt out of pausing music")
+  }
+
   /// The Advanced pane's "Check for Updates" button runs the check and reports
   /// the result in a modal. Under UI testing the check is stubbed offline to
   /// always report up-to-date, so clicking it surfaces the "You’re up to date"

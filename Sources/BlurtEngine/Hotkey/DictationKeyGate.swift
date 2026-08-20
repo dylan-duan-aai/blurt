@@ -5,7 +5,8 @@
 /// it means is decided on key-up by how long it was held: a release at or past
 /// `holdThreshold` is a hold (push-to-talk → stop), a shorter release is a tap
 /// (latch recording on; the next tap stops it). A press combined with any other
-/// key is a normal modifier shortcut (e.g. ⌘C), not dictation.
+/// key is a normal modifier shortcut (e.g. ⌘C), not dictation. Escape discards a
+/// dictation in flight.
 ///
 /// The gate reads no clock — callers pass monotonic timestamps as a `Duration`
 /// from a fixed reference, so every decision is deterministic and unit-testable.
@@ -14,7 +15,11 @@ public struct DictationKeyGate: Sendable {
 
   /// A release held at least this long counts as a hold (push-to-talk stop);
   /// shorter is a tap. 1 s is a good default when one key does both jobs.
-  public var holdThreshold: Duration
+  ///
+  /// `let`, not `var`: the gate's contract is that every decision follows from the
+  /// constructor arguments plus the timestamps callers pass, so a threshold that
+  /// could change mid-session would make the same event sequence non-deterministic.
+  public let holdThreshold: Duration
 
   private enum State: Sendable, Equatable {
     case idle
@@ -30,10 +35,10 @@ public struct DictationKeyGate: Sendable {
   private var state: State = .idle
 
   /// Whether the gate holds no in-flight dictation (neither armed nor latched).
-  /// The event tap's disabled-tap recovery reads this before `reset()` to know
-  /// whether the reset is discarding a live recording that the caller must
-  /// cancel upstream — otherwise the session would stay `.recording` with no
-  /// key-up ever arriving.
+  /// `DictationKeyRouter.reset()` reads this to report whether it just discarded a
+  /// live recording that the caller must cancel upstream (rebinding, or the
+  /// disabled-tap recovery in `recoverFromDroppedEvents(triggerStillHeld:)`) —
+  /// otherwise the session would stay `.recording` with no key-up ever arriving.
   public var isIdle: Bool { state == .idle }
 
   public init(holdThreshold: Duration = .seconds(1)) {
@@ -79,6 +84,25 @@ public struct DictationKeyGate: Sendable {
     case .idle, .latched:
       return .none
     }
+  }
+
+  /// Escape pressed: throw away whatever dictation this gate is tracking.
+  ///
+  /// Distinct from `otherKeyDown()`, which reads a second key as a *modifier
+  /// combo* and so deliberately passes through over a latched recording (⌘C
+  /// while toggle-dictating is a copy, not a cancel). Escape carries no such
+  /// ambiguity — it is only ever "discard this" — so it cancels from every live
+  /// state: a held push-to-talk, a latched toggle recording, and a re-press over
+  /// a latch. Returns `.none` from `.idle` so the key stays inert when the gate
+  /// holds nothing; the *pipeline*'s post-recording window is the router's call,
+  /// not the gate's (see `DictationKeyRouter.dictationIsActive`).
+  ///
+  /// Clears state either way, so a still-held trigger's eventual key-up routes to
+  /// `.none` rather than emitting a `.stop` for the dictation just cancelled.
+  public mutating func escapeKeyDown() -> Action {
+    let hadLiveDictation = !isIdle
+    state = .idle
+    return hadLiveDictation ? .cancel : .none
   }
 
   /// Clears state to idle without emitting — used when the event tap is disabled

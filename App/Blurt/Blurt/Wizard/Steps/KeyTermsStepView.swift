@@ -3,9 +3,10 @@ import SwiftUI
 
 /// The "Key Terms" section of the Settings window: a free-text
 /// area where the user lists comma-separated domain words (names, jargon, product
-/// names). These are folded into every transcription's prompt as spelling priming
-/// (see `KeyTermsStore` / `TranscriptionPrompt.build`), so the model favors those
-/// spellings. Optional — it never gates setup; an empty list just sends no terms.
+/// names). These are sent as every dictation request's word-boost list
+/// (see `KeyTermsStore` / `KeytermsBoost`), so the model favors those exact
+/// spellings. Optional — it never gates setup; an empty list just sends no terms,
+/// which omits the field.
 struct KeyTermsStepView: View {
   /// Stored in UserDefaults so multiple settings windows/readers see edits live.
   ///

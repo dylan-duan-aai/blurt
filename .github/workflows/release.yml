@@ -1,0 +1,321 @@
+name: release
+
+# Build, sign, notarize, and publish a Blurt release from CI rather than from
+# the maintainer's Mac. The Developer ID key and the notary credential live in
+# GitHub secrets (see RELEASE.md) instead of one laptop's keychain, so a release
+# no longer depends on who is at which desk.
+#
+# Two ways in, and both are a deliberate act against one reviewed commit of
+# main — never a side effect of an arbitrary push, and never a tag trigger:
+#
+#  - Merging the version-bump PR from `release-bump.yml`. The push lands on main
+#    with a changed `CFBundleShortVersionString`, which is what the path filter
+#    and the `resolve` job below look for. Approving that PR is the deliberate
+#    act; it is reviewed, it ran `check`, and it is one specific commit. This is
+#    the normal path — it means a release needs no workflow dispatch at all.
+#  - A manual dispatch, for re-running a release whose build failed, for
+#    `republish`, and for the non-main build-only dry run.
+#
+# Either way the release still parks on the `release-publish` approval gate
+# before anything reaches users, and both jobs pin `github.sha`.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z) — must match project.yml on the dispatched ref"
+        required: true
+        type: string
+      republish:
+        description: "Overwrite an existing tag + release with fresh artifacts (never for a code bug — bump a patch)"
+        type: boolean
+        default: false
+      skip_checks:
+        description: "Skip scripts/check.sh (it already ran on this commit in the check workflow)"
+        type: boolean
+        default: false
+      skip_smoke:
+        description: "Skip the launch smoke test (use if the runner has no usable GUI session)"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    # Narrow on purpose. project.yml is the only file a version bump touches
+    # that isn't generated, so this is "something about the app's version may
+    # have changed" — the `resolve` job then decides whether it actually did.
+    paths:
+      - App/Blurt/project.yml
+
+# One release at a time, and never cancel one in flight: a half-run that has
+# already notarized or tagged is worse than a queued one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Decide what — if anything — this run is releasing, before any macOS minutes
+  # or the signing key are spent. Cheap and Linux-only: it is bash over
+  # project.yml and the tag list.
+  #
+  # A dispatch says the version outright. A push has to be interrogated: the
+  # path filter fires for any project.yml edit (adding a source file, changing a
+  # build setting), and only a changed CFBundleShortVersionString with no tag
+  # behind it is a release.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      release: ${{ steps.resolve.outputs.release }}
+
+    steps:
+      - name: Checkout blurt
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: blurt
+          ref: ${{ github.sha }}
+          # Tags decide whether this version already shipped, and the push's
+          # previous commit is what "the version changed" is measured against —
+          # a shallow clone has neither.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the release version
+        id: resolve
+        working-directory: blurt
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$PWD"
+          # shellcheck disable=SC1091  # sourced at runtime from the checkout
+          source scripts/release-lib.sh
+
+          version="$(require_project_version App/Blurt/project.yml)"
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            # The dispatcher named a version; it must be the one this commit
+            # carries, and their say-so is the deliberate act — republish and
+            # re-runs of a failed build both have to work, so no tag check here.
+            is_semver "$INPUT_VERSION" || die "version input must be X.Y.Z (got: $INPUT_VERSION)"
+            [ "$version" = "$INPUT_VERSION" ] \
+              || die "dispatched version $INPUT_VERSION but ${GITHUB_SHA:0:7} is at $version — dispatch the commit that carries the bump"
+            echo "version=$version" >>"$GITHUB_OUTPUT"
+            echo "release=true" >>"$GITHUB_OUTPUT"
+            info "dispatched: releasing v$version"
+            exit 0
+          fi
+
+          # --- push to main ---
+          skip() {
+            echo "release=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::$1 — not releasing."
+            { echo "### No release from this push"; echo; echo "$1."; } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          # Did the version actually change in this push? Fail open if the
+          # previous commit can't be resolved (a force-push, a first push): an
+          # extra build costs runner time, and the publish gate still holds.
+          prev="$BEFORE"
+          git cat-file -e "${prev}^{commit}" 2>/dev/null || prev="$(git rev-parse --verify --quiet 'HEAD^' || true)"
+          if [ -n "$prev" ]; then
+            prev_version="$(git show "$prev:App/Blurt/project.yml" 2>/dev/null | parse_short_version || true)"
+            if [ "$prev_version" = "$version" ]; then
+              skip "project.yml changed but the version is still $version"
+            fi
+            info "version changed: ${prev_version:-unknown} → $version"
+          else
+            echo "::notice::could not resolve the previous commit — treating $version as new."
+          fi
+
+          if tag_exists_locally "v$version" || tag_exists_on_origin "v$version"; then
+            skip "v$version is already tagged"
+          fi
+
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "release=true" >>"$GITHUB_OUTPUT"
+          info "bump merged: releasing v$version from $GITHUB_SHA"
+          {
+            echo "### Releasing v$version"
+            echo
+            echo "Triggered by the version bump landing on \`main\`. The build job signs and"
+            echo "notarizes; publishing then waits on the \`release-publish\` approval."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # Build + sign + notarize + staple + DMG. Produces the exact artifacts the
+  # publish job uploads — nothing is rebuilt downstream, so what a human tests
+  # from this run's artifacts is byte-for-byte what ships.
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.release == 'true'
+    runs-on: macos-26
+    timeout-minutes: 120
+    # Holds the signing + notary secrets. Restrict this environment to the
+    # `main` branch in repo settings so a fork or a stray branch can't reach the
+    # Developer ID key.
+    environment: release-build
+
+    steps:
+      - name: Checkout blurt
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: blurt
+          # Pin to the dispatched commit rather than the branch tip: the publish
+          # job checks out the same sha, so the tag can never land on a commit
+          # other than the one that was actually built.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Guard the release version
+        working-directory: blurt
+        # `resolve` already established this, on its own checkout. Re-checking it
+        # here on the runner that does the signing keeps the artifact name and
+        # the built binary provably the same version.
+        env:
+          WANT_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091  # sourced at runtime from the checkout
+          source scripts/release-lib.sh
+          GOT_VERSION="$(require_project_version App/Blurt/project.yml)"
+          is_semver "$WANT_VERSION" || die "resolved version must be X.Y.Z (got: $WANT_VERSION)"
+          [ "$GOT_VERSION" = "$WANT_VERSION" ] \
+            || die "releasing $WANT_VERSION but ${GITHUB_SHA:0:7} is at $GOT_VERSION — release the commit that carries the bump"
+          info "releasing v$GOT_VERSION from $GITHUB_SHA"
+
+      - name: Check the signing secrets are configured
+        # Fail here rather than 25 minutes later at the signing step. Only
+        # presence is checked — the values are never echoed.
+        env:
+          P12: ${{ secrets.SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "$P12" ] || missing="$missing SIGNING_P12_BASE64"
+          [ -n "$P12_PASSWORD" ] || missing="$missing SIGNING_P12_PASSWORD"
+          [ -n "$NOTARY_KEY_P8" ] || [ -n "$NOTARY_APPLE_ID" ] \
+            || missing="$missing NOTARY_KEY_P8_BASE64-or-NOTARY_APPLE_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::missing secret(s) on the release-build environment:$missing — see RELEASE.md"
+            exit 1
+          fi
+
+      - name: Note a build-only dry run
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::notice::Dispatched from ${GITHUB_REF}, not main — this is a build/sign/notarize dry run. The publish job will not run."
+
+      - name: Install build tools
+        working-directory: blurt
+        # create-dmg is release-only, so it is not in the Brewfile the check
+        # workflow installs on every PR.
+        run: |
+          brew bundle --file=Brewfile
+          brew install create-dmg
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build, sign, notarize, staple
+        working-directory: blurt
+        env:
+          # Developer ID Application cert + key, exported as a .p12 and
+          # base64-encoded. Imported into an ephemeral keychain that is deleted
+          # when the script exits.
+          BLURT_SIGNING_P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
+          BLURT_SIGNING_P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+          # Notary credential. The App Store Connect API key is preferred (it is
+          # revocable on its own and never appears in a process list); the Apple
+          # ID pair below is the fallback for a team without API-key access.
+          BLURT_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          BLURT_NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          BLURT_NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          BLURT_NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          BLURT_NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          # Both are dispatch-only escape hatches, so both are empty (and the
+          # full checks run) on the merged-bump path. That is the right default:
+          # nobody is standing there to judge whether skipping was safe.
+          SKIP_CHECKS: ${{ inputs.skip_checks }}
+          SKIP_SMOKE: ${{ inputs.skip_smoke }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$SKIP_CHECKS" = "true" ]; then args+=(--skip-checks); fi
+          if [ "$SKIP_SMOKE" = "true" ]; then args+=(--skip-smoke); fi
+          scripts/release-build.sh ${args[@]+"${args[@]}"}
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ needs.resolve.outputs.version }}
+          # Explicit paths, not the whole build/release tree: derived/ and
+          # stage/ are multi-GB build scratch that nothing downstream reads.
+          path: |
+            blurt/build/release/Blurt-*.dmg
+            blurt/build/release/Blurt-*.app.dSYM.zip
+            blurt/build/release/SHA256SUMS
+            blurt/build/release/build-info.txt
+            blurt/build/release/notary-*-log.json
+          if-no-files-found: error
+
+  # Tag, push, and publish the GitHub Release from the artifacts above.
+  #
+  # The `release-publish` environment is the ship gate that the local
+  # `release-install.sh` step used to be: configure it with required reviewers so
+  # this job parks until a human has downloaded the DMG from the build job's
+  # artifacts, installed it, and confirmed it works.
+  publish:
+    needs: [resolve, build]
+    # Releases ship from main. A dispatch from any other ref stops after the
+    # build job, which makes this workflow safe to exercise as a dry run.
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 30
+    environment: release-publish
+    permissions:
+      # contents: write is what lets the tag push and the release create land.
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout blurt
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: blurt
+          ref: ${{ github.sha }}
+          # The publish step pushes the release tag, so keep the token on the
+          # origin remote (contents: write above is what makes the push land).
+          persist-credentials: true
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-${{ needs.resolve.outputs.version }}
+          path: blurt/build/release
+
+      - name: Identify the tagger
+        working-directory: blurt
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Tag + publish
+        working-directory: blurt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPUBLISH: ${{ inputs.republish }}
+        run: |
+          set -euo pipefail
+          args=(--yes)
+          if [ "$REPUBLISH" = "true" ]; then args+=(--republish); fi
+          scripts/release-publish.sh "${args[@]}"

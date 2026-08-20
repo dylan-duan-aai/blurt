@@ -10,6 +10,7 @@ struct DictationKeyGateTests {
     case down(Duration)
     case up(Duration)
     case other
+    case escape
     case reset
   }
 
@@ -95,6 +96,46 @@ struct DictationKeyGateTests {
         .init(.up(.milliseconds(1200)), .stop),
       ]),
     Scenario(
+      name: "escape cancels a held push-to-talk, and the trailing key-up is inert",
+      steps: [
+        .init(.down(.seconds(0)), .start), .init(.escape, .cancel),
+        // The trigger is still physically held; its release must not re-stop the
+        // dictation escape already threw away.
+        .init(.up(.milliseconds(1200)), DictationKeyGate.Action.none),
+        .init(.down(.seconds(2)), .start),
+      ]),
+    Scenario(
+      name: "escape cancels a latched toggle recording — the gap combos leave open",
+      steps: [
+        .init(.down(.seconds(0)), .start), .init(.up(.milliseconds(200))),  // latched
+        // `otherKeyDown` deliberately passes through here (⌘C stays a copy), which
+        // is why escape needs its own event: nothing else could stop this.
+        .init(.escape, .cancel),
+        .init(.down(.seconds(5)), .start),
+      ]),
+    Scenario(
+      name: "escape cancels a re-press over a latched recording",
+      steps: [
+        .init(.down(.seconds(0)), .start), .init(.up(.milliseconds(200))),  // latched
+        .init(.down(.seconds(5)), DictationKeyGate.Action.none),  // armed from latched
+        .init(.escape, .cancel),
+        .init(.up(.milliseconds(5100)), DictationKeyGate.Action.none),
+        .init(.down(.seconds(10)), .start),
+      ]),
+    Scenario(
+      name: "escape while idle is inert (the gate holds nothing to cancel)",
+      steps: [
+        .init(.escape, DictationKeyGate.Action.none), .init(.down(.seconds(1)), .start),
+      ]),
+    Scenario(
+      name: "escape after a hold has already stopped is inert",
+      steps: [
+        .init(.down(.seconds(0)), .start), .init(.up(.milliseconds(1200)), .stop),
+        // The pipeline may still be transcribing here, but that's the router's
+        // call to make (`dictationIsActive`) — the gate itself is done.
+        .init(.escape, DictationKeyGate.Action.none),
+      ]),
+    Scenario(
       name: "a rapid second tap while latched still stops (no multi-tap gesture)",
       steps: [
         .init(.down(.milliseconds(0)), .start), .init(.up(.milliseconds(80))),
@@ -112,6 +153,7 @@ struct DictationKeyGateTests {
       case .down(let t): action = g.modifierDown(at: t)
       case .up(let t): action = g.modifierUp(at: t)
       case .other: action = g.otherKeyDown()
+      case .escape: action = g.escapeKeyDown()
       case .reset:
         g.reset()
         action = nil
@@ -122,9 +164,10 @@ struct DictationKeyGateTests {
     }
   }
 
-  /// `isIdle` is what the event tap's disabled-tap recovery reads to decide
-  /// whether its reset just discarded a live recording it must cancel upstream,
-  /// so it has to be true exactly when no dictation is in flight.
+  /// `isIdle` is what `DictationKeyRouter.reset()` reads to decide whether it just
+  /// discarded a live recording the host must cancel upstream (on a rebind, or the
+  /// disabled-tap recovery), so it has to be true exactly when no dictation is in
+  /// flight.
   @Test("isIdle tracks armed and latched recordings")
   func isIdleTracksLiveRecordings() {
     var g = DictationKeyGate(holdThreshold: .seconds(1))

@@ -1,4 +1,4 @@
-/// Routes raw trigger-key events into `DictationKeyGate` and owns the two
+/// Routes raw trigger-key events into `DictationKeyGate` and owns the four
 /// decisions that would otherwise sit untested in the app's event-tap shim:
 ///
 /// - **Edge dedup.** `flagsChanged` deliveries re-report the bound key's flag
@@ -8,6 +8,12 @@
 /// - **Relevance.** Only the bound keycode's flag changes drive the modifier;
 ///   a `keyDown` for any *other* key marks a combo (e.g. ⌘C over the held
 ///   trigger), and the trigger's own keycode never counts as a combo.
+/// - **Cancel.** Escape is not a combo but a discard: it cancels a dictation
+///   anywhere in flight, including the transcribe/inject window the gate has
+///   already forgotten about (see `dictationIsActive`).
+/// - **Dropped-event recovery.** After the host's tap is disabled and re-enabled,
+///   whether the gate's state survives depends on the trigger still being held —
+///   see `recoverFromDroppedEvents(triggerStillHeld:)`.
 ///
 /// Like the gate, the router reads no clock — callers pass monotonic timestamps
 /// — so every decision is deterministic and unit-testable. The app-side
@@ -26,6 +32,22 @@ public struct DictationKeyRouter: Sendable {
 
   /// The virtual keycode of the bound trigger modifier (`TriggerKey.keyCode`).
   public private(set) var triggerKeyCode: Int
+
+  /// Escape's macOS virtual keycode — the cancel key, not a bindable trigger, so
+  /// it's a router constant rather than a `TriggerKey` case.
+  public static let escapeKeyCode = 53
+
+  /// Whether the session still has a dictation in flight — recording, or past
+  /// the recording and mid transcribe/inject. Fed by the host from the phase it
+  /// already observes (`!PipelinePhase.isTerminal`), because Escape has to keep
+  /// cancelling through a window the gate cannot see: a tap-to-stop leaves the
+  /// gate `.idle` while the transcript is still being fetched and pasted, and
+  /// "Escape kills it" must hold for that stretch too — it's the one the user
+  /// is actually staring at the "Transcribing…" pill during.
+  ///
+  /// Defaults to false, so a host that never sets it gets Escape-cancels-
+  /// recording and nothing more — never a cancel fired at an idle session.
+  public var dictationIsActive = false
 
   private var gate: DictationKeyGate
   /// The bound modifier's current physical state, so repeated `flagsChanged`
@@ -53,8 +75,20 @@ public struct DictationKeyRouter: Sendable {
       }
       return .none
     case .keyDown(let keyCode):
+      if keyCode == Self.escapeKeyCode { return escapeKeyDown() }
       return keyCode == triggerKeyCode ? .none : gate.otherKeyDown()
     }
+  }
+
+  /// Escape: the gate cancels whatever live state it holds, and a gate that holds
+  /// nothing still cancels while the host reports a dictation in flight (the
+  /// post-recording transcribe/inject window — see `dictationIsActive`). Only a
+  /// genuinely idle pipeline leaves Escape inert, which matters because the tap
+  /// is listen-only and sees every Escape pressed anywhere on the system.
+  private mutating func escapeKeyDown() -> DictationKeyGate.Action {
+    let action = gate.escapeKeyDown()
+    if action != .none { return action }
+    return dictationIsActive ? .cancel : .none
   }
 
   /// Rebinds the trigger and resets: events already tracked belong to the old
@@ -63,6 +97,31 @@ public struct DictationKeyRouter: Sendable {
   @discardableResult
   public mutating func rebind(triggerKeyCode: Int) -> Bool {
     self.triggerKeyCode = triggerKeyCode
+    return reset()
+  }
+
+  /// Recovery after the host's event tap was disabled (by timeout, or by user input
+  /// while it was down) and re-enabled: events may have been dropped, so the gate's
+  /// state may no longer match the keyboard.
+  ///
+  /// `triggerStillHeld` is the caller's read of whether the trigger modifier is
+  /// physically down *right now* — `CGEventSource.flagsState` on the app side, the
+  /// one CoreGraphics-typed input, which is why it's passed in rather than read
+  /// here. If it is, nothing that matters was lost: the key-up is still coming and
+  /// the gate is coherent, so the state is kept — resetting would discard speech the
+  /// user is mid-sentence on. If it isn't, the trigger's key-up may have been among
+  /// the dropped events, so the gate is reset.
+  ///
+  /// Returns whether that reset discarded a live recording the caller must cancel
+  /// upstream, matching `reset()` and `rebind(triggerKeyCode:)`. This lived in the
+  /// shell as a bare `if`, where nothing could test it — the app target has no test
+  /// target and a `CGEventTap` can't be driven from XCUITest — while carrying the
+  /// worst failure of the three decisions here: a session left in `.recording` with
+  /// no key event able to end it, until the auto-release cap pastes an unprompted
+  /// transcript.
+  @discardableResult
+  public mutating func recoverFromDroppedEvents(triggerStillHeld: Bool) -> Bool {
+    guard !triggerStillHeld else { return false }
     return reset()
   }
 

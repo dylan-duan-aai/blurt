@@ -75,14 +75,17 @@ utterance.
   restored around it. If the target app quit while you were speaking, the text
   stays on the clipboard instead of vanishing.
 - **One key, no chords** — dictation is triggered by a single lone modifier
-  (right ⌘ by default; right ⌥ and `fn` also available). Tap to toggle, hold
+  (right ⌘ by default; right ⌥ also available). Tap to toggle, hold
   for push-to-talk. The event tap swallows nothing: a lone modifier types
   nothing anyway, and combos like ⌘C pass through untouched.
 - **Polished in one step** — each utterance rides to AssemblyAI's dictation API
-  with a contextual prompt built from the focused app, window, and field, the
-  text around your cursor, and your own key terms; the same call runs a
-  server-side LLM cleanup (disfluencies out, punctuation fixed), so the text
-  comes back already polished. No second request, no model downloads.
+  with a little context and nothing more; the same call runs a server-side LLM
+  cleanup (disfluencies out, punctuation fixed), so the text comes back already
+  polished. No second request, no model downloads. The context is what makes the
+  transcript continue naturally — your recent dictations and the text just before
+  your cursor — and nothing else about your screen goes with it: not the app, not
+  the window title, not the field, not your selection. See
+  [Privacy](#privacy).
 - **Fast** — transcription and cleanup share one round trip that typically
   finishes in about a second. Blurt pre-warms the HTTPS connection while
   you're still speaking and flips to "transcribing" at key-up, so polished
@@ -92,6 +95,15 @@ utterance.
   on AssemblyAI's published benchmarks.
 - **Multilingual** — works in 18 languages, detected automatically, and you
   can code-switch mid-sentence.
+- **Escape to throw it away** — press <kbd>esc</kbd> and the dictation is
+  cancelled: while you're still speaking, or after, right up until the text
+  lands. Nothing is transcribed and nothing is pasted. Escape isn't swallowed,
+  so it still reaches whatever app you're in.
+- **Quiets your music** — start dictating and Spotify or Apple Music pauses,
+  then resumes the moment you stop. Only ever pauses a player that's already
+  playing, so it can't start music you didn't ask for. Browser audio isn't
+  covered: nothing on macOS will tell an app whether a browser tab is playing,
+  and pausing blindly would start playback as often as it stopped it.
 - **Live feedback** — a floating overlay pill shows a real-time mic level
   meter and the pipeline phase; a menu bar indicator mirrors it from anywhere.
 - **Actual synth cues** — start and stop can be cued by real Yamaha DX7 or
@@ -126,16 +138,29 @@ From a fresh install to dictated text in your editor:
 3. **Tap right ⌘ and speak** — the overlay pill shows the live mic level. Tap
    again to stop, or hold the key and release for push-to-talk.
 4. **Read what you said** — the polished transcript is pasted at your cursor.
-5. **Tune it** — open Settings to change the trigger key, add key terms
-   (names, jargon, product words the model should get right), or pick a synth
-   sound pack.
+5. **Tune it** — open Settings to change the trigger key or pick a synth sound
+   pack.
 
 ## Privacy
 
 Blurt stores your API key in the macOS Keychain. Audio is captured only while
-you are dictating, then sent over HTTPS to AssemblyAI for transcription. Blurt
-stores no audio and no transcripts, and sends no telemetry — no crash
-reporting, no analytics, no usage tracking.
+you are dictating, then sent over HTTPS to AssemblyAI for transcription.
+
+The request also carries context, so the transcript continues naturally from what
+came before: your recent dictations from this session, and a short run of the text
+immediately before your cursor — never the contents of a password field, which
+Blurt refuses to read. Anything you dictate _into_ a password field is likewise
+never kept as context. Your key terms from Settings ride along too, to bias
+spelling. Nothing else about your screen is sent: not the app you are in, not the
+window title, not the field you are typing in, not what you have selected.
+
+That recent-dictation history lives in memory only — it is never written to disk,
+it is cleared when you quit Blurt, and it is capped (100 dictations, and about
+4096 characters per request, oldest dropped first). Note what it means while Blurt
+is running: text you dictated in one app can be sent as context with a later
+dictation in another. Quit and reopen Blurt to clear it. Blurt stores no audio and
+no transcripts, and sends no telemetry — no crash reporting, no analytics, no
+usage tracking.
 
 Because transcription is processed by AssemblyAI, their
 [Privacy Policy](https://www.assemblyai.com/legal/privacy-policy) and
@@ -148,16 +173,19 @@ Blurt is MIT-licensed and needs only Xcode and Homebrew to build:
 
 ```bash
 scripts/bootstrap.sh   # install the local toolchain
-scripts/dev-build.sh   # build + install Blurt to /Applications
+scripts/dev-build.sh   # build + install "Blurt Dev" to /Applications
 scripts/check.sh       # full repo health check — the same script CI runs
 swift test             # engine unit tests only
 ```
 
 `dev-build.sh` installs to `/Applications` on purpose: macOS won't register
 Accessibility/Input-Monitoring permissions for apps living in build
-directories, so the app needs a stable install path to be usable at all.
-[`AGENTS.md`](./AGENTS.md) has the architecture notes and full workflow;
-[`CONTRIBUTING.md`](./CONTRIBUTING.md) covers how changes land.
+directories, so the app needs a stable install path to be usable at all. It
+installs as `Blurt Dev.app` under its own bundle id, so it sits beside a
+released Blurt instead of replacing it.
+[`CONTRIBUTING.md`](./CONTRIBUTING.md) has the full local setup — prerequisites,
+what each script does, signing — and how changes land;
+[`AGENTS.md`](./AGENTS.md) has the architecture notes.
 
 ## Architecture
 
@@ -166,14 +194,17 @@ Sources/BlurtEngine/     Swift 6 package owning the pipeline — no external dep
   Audio/                 MicCapture: fresh AVAudioRecorder per session, 16 kHz mono PCM,
                          live level meter; DX7/Juno-106 sound packs
   STT/                   AssemblyAITranscriber: one POST to dictation.assemblyai.com/transcribe
-                         (STT + LLM rewrite) + TranscriptionPrompt contextual priming
+                         (STT + LLM rewrite); ConversationContext (contextual priming:
+                         your recent dictations then the text before the cursor, and
+                         nothing else about your screen); KeytermsBoost (key terms as
+                         the word-boost list)
   Pipeline/              DictationSession actor: press/release/cancel commands, phase
                          stream, auto-release before the API's recording cap
   Hotkey/                DictationKeyGate/Router: pure, unit-tested state machine for the
                          lone-modifier trigger (tap vs hold vs combo)
   Injection/             KeyInjector: save clipboard → paste via synthesized ⌘V → restore
-  FocusCapture/          Accessibility reads of the focused app/window/field that prime
-                         the transcription prompt
+  FocusCapture/          Accessibility reads of the focused app/window/field, kept local:
+                         paste spacing and the developer-mode log
   Config/, Update/       Keychain API-key store, key terms, download-only release check
 
 App/Blurt/               AppKit/SwiftUI shell (Xcode project generated by XcodeGen)
@@ -185,8 +216,9 @@ App/Blurt/               AppKit/SwiftUI shell (Xcode project generated by XcodeG
 
 The engine is a standalone package you can embed to build your own dictation
 app — mic capture, dictation-API transcription, and paste-into-the-focused-app behind
-three protocol seams, fully stubbed in tests. [`BLURTENGINE.md`](./BLURTENGINE.md)
-is the developer guide.
+three protocol seams, fully stubbed in tests.
+[`Sources/BlurtEngine/README.md`](./Sources/BlurtEngine/README.md) is the
+developer guide.
 
 Latency note: perceived speed is mostly bookkeeping. `press()` warms up the
 HTTPS connection and kicks off the focused-field context read without awaiting

@@ -5,7 +5,7 @@ import os
 ///   log show --predicate 'subsystem == "dev.alex.blurt" && category == "Transcriber"' --last 1h
 /// File-scoped so both `send(_:body:audioDurationMs:)` (wall-clock) and
 /// `MetricsLogger` (the DNS/TCP/TLS/TTFB split) can write to it.
-private let transcriberLog = Logger(subsystem: BlurtIdentity.subsystem, category: "Transcriber")
+private let transcriberLog = HostIdentity.current.logger("Transcriber")
 
 /// `TranscriberProtocol` backed by AssemblyAI's **dictation** API.
 ///
@@ -14,7 +14,8 @@ private let transcriberLog = Logger(subsystem: BlurtIdentity.subsystem, category
 /// re-encoding pass) plus a JSON `config` part, and the response body carries
 /// both the verbatim transcript and — when the config requests one via its
 /// `llm` block (the "enhanced transcripts" setting, on by default) — an
-/// LLM-rewritten version with disfluencies removed and punctuation fixed.
+/// LLM-rewritten version with disfluencies removed, produced by applying
+/// `CleanupInstruction.text` server-side.
 /// No upload step, no job submission, no polling — one
 /// request per utterance covers transcription *and* cleanup. The service picks
 /// the STT model server-side and handles audio from ~80 ms up to 120 s; the
@@ -25,6 +26,7 @@ public struct AssemblyAITranscriber: TranscriberProtocol {
   private let baseURL: URL
   private let transport: any HTTPTransport
   private let enhancedTranscriptsEnabled: @Sendable () -> Bool
+  private let customStyle: @Sendable () -> String?
 
   /// Idle timeout for the transcribe round trip — `URLRequest.timeoutInterval` is
   /// reset each time data moves, so this bounds *stalls*, not total elapsed time.
@@ -36,21 +38,25 @@ public struct AssemblyAITranscriber: TranscriberProtocol {
   private static let requestTimeoutSeconds: TimeInterval = 90
 
   /// `enhancedTranscripts` decides, per request, whether the config carries
-  /// the `llm` cleanup-rewrite block. Read at every `transcribe` so a settings
-  /// change applies to the next dictation without rebuilding the transcriber.
-  /// `nil` (the default) reads `EnhancedTranscriptsStore` — spelled as an
-  /// optional rather than a default closure because a public default argument
-  /// can't reference the store's internal `isEnabled`.
+  /// the `llm` cleanup-rewrite block; `customStyle` supplies the user's custom
+  /// style instructions appended to that block's cleanup instruction. Both are
+  /// read at every `transcribe` so a settings change applies to the next
+  /// dictation without rebuilding the transcriber. `nil` (the default) reads
+  /// the corresponding store — spelled as optionals rather than default
+  /// closures because a public default argument can't reference a store's
+  /// internal member.
   public init(
     apiKeyProvider: @escaping @Sendable () -> String? = { APIKeyStore.current },
     baseURL: URL = URL(staticString: "https://dictation.assemblyai.com"),
     transport: any HTTPTransport = URLSession.shared,
-    enhancedTranscripts: (@Sendable () -> Bool)? = nil
+    enhancedTranscripts: (@Sendable () -> Bool)? = nil,
+    customStyle: (@Sendable () -> String?)? = nil
   ) {
     self.apiKeyProvider = apiKeyProvider
     self.baseURL = baseURL
     self.transport = transport
     self.enhancedTranscriptsEnabled = enhancedTranscripts ?? { EnhancedTranscriptsStore().isEnabled }
+    self.customStyle = customStyle ?? { CustomStyleStore().instructions }
   }
 
   // MARK: - Dictation request
@@ -61,8 +67,17 @@ public struct AssemblyAITranscriber: TranscriberProtocol {
     guard let apiKey = apiKeyProvider(), !apiKey.isEmpty else {
       throw BlurtError.apiKeyMissing
     }
-    let prompt = TranscriptionPrompt.build(context: context)
-    let config = try makeConfigData(sampleRate: sampleRate, prompt: prompt)
+    // The prior dialogue that goes on the wire: the user's recent dictations,
+    // then the text before the cursor (empty when there is neither, which omits
+    // the field). App name, window title, field label and selected text stay on
+    // the machine — `ConversationContext` draws that line, so nothing is
+    // filtered here.
+    let conversation = ConversationContext.turns(context: context)
+    // The other steering field: the user's key terms as a word-boost list,
+    // fitted to its own (different) cap.
+    let boost = KeytermsBoost.fitted(context?.keyTerms ?? [])
+    let config = try makeConfigData(
+      sampleRate: sampleRate, conversationContext: conversation, wordBoost: boost)
     let boundary = "blurt-\(UUID().uuidString)"
 
     var request = URLRequest(url: baseURL.appendingPathComponent("transcribe"))
@@ -115,22 +130,46 @@ public struct AssemblyAITranscriber: TranscriberProtocol {
       "warm-up connect \(elapsedMs, format: .fixed(precision: 0), privacy: .public)ms")
   }
 
-  /// Builds the JSON `config` part sent alongside the audio. The context
-  /// `prompt` is included only when non-empty; a nil or blank prompt omits the
-  /// field so the server applies its default prompt. The `llm` block rides
+  /// Builds the JSON `config` part sent alongside the audio. Both steering
+  /// fields are included only when non-empty: an empty `conversationContext`
+  /// omits `conversation_context` (no prior dialogue, so the model works from the
+  /// audio alone) and an empty `wordBoost` omits `word_boost` (which would
+  /// otherwise ask to boost nothing). There is no `prompt` — see
+  /// `ConversationContext` for why the service's managed default is what steers
+  /// transcription now. The `llm` block rides
   /// along while enhanced transcripts are enabled (the default) and is omitted
   /// entirely when the user has turned them off, so the service skips the
   /// rewrite and the verbatim transcript is what gets pasted — see
   /// `DictationConfig.llm`. Internal so tests can assert the
-  /// prompt wiring without inspecting the multipart upload body (which
+  /// config wiring without inspecting the multipart upload body (which
   /// `URLProtocol` mocks can't observe reliably for `upload(from:)`).
-  func makeConfigData(sampleRate: Int, prompt: String?) throws -> Data {
-    try JSONEncoder().encode(
+  /// Neither steering field is defaulted: every caller states both, so what a
+  /// given request does and does not steer with is readable at the call site
+  /// rather than inferred from which argument was left off.
+  func makeConfigData(
+    sampleRate: Int, conversationContext: [String], wordBoost: [String]
+  ) throws -> Data {
+    let enhanced = enhancedTranscriptsEnabled()
+    let instruction = enhanced ? CleanupInstruction.sendable(appending: customStyle()) : nil
+    if enhanced, instruction == nil {
+      // Unreachable while the tests run: `CleanupInstructionTests` asserts the length.
+      // Logged rather than trusted because the failure it guards against is silent —
+      // the request would 400 and every dictation would error, so a line naming the
+      // real cause is worth the one comparison per request it costs.
+      transcriberLog.error(
+        """
+        cleanup instruction is \(CleanupInstruction.text.utf8.count, privacy: .public) UTF-8 bytes, \
+        over the \(CleanupInstruction.characterCap, privacy: .public) cap; \
+        falling back to the service default
+        """)
+    }
+    return try JSONEncoder().encode(
       DictationConfig(
         sampleRate: sampleRate,
         channels: 1,
-        prompt: prompt.trimmedNonEmpty(),
-        llm: enhancedTranscriptsEnabled() ? LLMRewrite() : nil
+        conversationContext: conversationContext,
+        wordBoost: wordBoost,
+        llm: enhanced ? LLMRewrite(instruction: instruction) : nil
       )
     )
   }
@@ -206,71 +245,10 @@ public struct AssemblyAITranscriber: TranscriberProtocol {
     return String(raw.prefix(500))
   }
 
-  // MARK: - Wire types
-
-  private struct DictationConfig: Encodable {
-    let sampleRate: Int
-    let channels: Int
-    /// Custom transcription instruction. Encoded only when non-nil (the
-    /// synthesized `encode` uses `encodeIfPresent` for optionals), so omitting
-    /// it falls back to the server's default prompt. Steers *transcription*;
-    /// the cleanup rewrite is the `llm` block's job.
-    let prompt: String?
-    /// The rewrite request, present only while enhanced transcripts are
-    /// enabled (nil — the synthesized `encode` omits it — asks for no rewrite,
-    /// so the response's `llm_response` is null and the verbatim `text` is
-    /// used). An empty object selects the service's default
-    /// cleanup instruction; per the API's `instruction`-mode rules, output
-    /// format and don't-answer-the-text safeguards are enforced server-side,
-    /// so nothing rides along here.
-    let llm: LLMRewrite?
-    enum CodingKeys: String, CodingKey {
-      case sampleRate = "sample_rate"
-      case channels
-      case prompt
-      case llm
-    }
-  }
-
-  private struct LLMRewrite: Encodable {}
-
-  private struct DictationResponse: Decodable {
-    /// The verbatim transcript — always present, never altered by the LLM.
-    let text: String
-    /// The rewritten transcript, or nil when the rewrite failed or timed out.
-    let llmResponse: String?
-    /// `"timeout"` or `"error"` when a requested rewrite failed.
-    let llmError: String?
-    enum CodingKeys: String, CodingKey {
-      case text
-      case llmResponse = "llm_response"
-      case llmError = "llm_error"
-    }
-  }
-
-  /// A dictation API failure body. The reference documents exactly two shapes:
-  /// `{error_code, message}` for the request/audio/server errors (400, 413, 415,
-  /// 500, 503, 504) and `{detail}` for auth and rate limiting — so read
-  /// `message`, then `detail`. A non-string `detail` (a FastAPI-style validation
-  /// array) is ignored and the caller falls back to the raw body.
-  private struct ErrorResponse: Decodable {
-    let message: String?
-
-    enum CodingKeys: String, CodingKey {
-      case message, detail
-    }
-
-    init(from decoder: Decoder) throws {
-      let container = try decoder.container(keyedBy: CodingKeys.self)
-      // `try? decode` already yields `String?` for a key that is missing, null,
-      // or the wrong type — `decodeIfPresent` would return `String??` here and
-      // need flattening back down.
-      func string(_ key: CodingKeys) -> String? {
-        try? container.decode(String.self, forKey: key)
-      }
-      message = string(.message) ?? string(.detail)
-    }
-  }
+  // The request/response types this encodes and decodes — `DictationConfig`,
+  // `LLMRewrite`, `DictationResponse`, `ErrorResponse` — live in
+  // `DictationWireTypes.swift`, split out to stay within the lint file-length
+  // budget. They are the JSON contract; everything here is the transport.
 }
 
 /// Per-request `URLSessionTaskDelegate` that logs the dictation round-trip's latency
@@ -306,14 +284,10 @@ private final class MetricsLogger: NSObject, URLSessionTaskDelegate, @unchecked 
   }
 }
 
-extension Duration {
-  /// This duration in milliseconds as a Double (for latency logging). Expressed
-  /// as a ratio of two `Duration`s rather than reassembled from `components`,
-  /// which meant restating the attoseconds-per-millisecond constant by hand.
-  fileprivate var milliseconds: Double {
-    self / Duration.milliseconds(1)
-  }
-}
+// `Duration.milliseconds` — the latency-logging conversion this file's request
+// timing uses — moved to `Duration+Milliseconds.swift` when `MicCapture` needed
+// the same thing for its liveness-gap line. It was `fileprivate` here; a second
+// copy is an "invalid redeclaration", not a shadow.
 
 /// Errors specific to the AssemblyAI transport. These get wrapped in
 /// `BlurtError.sttFailed` before reaching the UI.

@@ -140,9 +140,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // though no window is shown. `onNeedsForeground` fires when a configured app
     // loses a requirement (e.g. a revoked permission) so the user is pulled back
     // into onboarding even if every window was closed.
-    // Clear a stale Accessibility grant left by a signing-team change before the
-    // wizard's first permission check, so an updated user isn't stuck on a modal
-    // that never dismisses. See runAccessibilityGrantMigration().
+    // Clear a stale Accessibility grant left by a change of signing identity (a
+    // re-signed release, or the next ad-hoc dev build) before the wizard's first
+    // permission check, so the user isn't stuck on a modal that never dismisses.
+    // See runAccessibilityGrantMigration().
     runAccessibilityGrantMigration()
 
     let wizard = makeWizardController(coord: coord)
@@ -193,23 +194,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     #endif
   }
 
-  /// One-shot startup migration: if the signing team changed since the last launch
-  /// (or was never recorded — every currently-shipped build), a prior Accessibility
-  /// grant is pinned to the old team's designated requirement and `tccd` will keep
-  /// reporting the re-signed binary as untrusted ("toggle on, still denied"). Reset
-  /// the grant once so the normal wizard grant flow recaptures a matching
-  /// requirement. Runs before the wizard's first permission check. No-ops for
-  /// ad-hoc/unsigned builds (Team ID is nil), so CI, `swift build`, and UI-test runs
-  /// never spawn `tccutil`. Persists the new team only on a successful reset, so a
-  /// failed reset retries next launch instead of being masked.
+  /// One-shot startup migration: if the signing identity changed since the last
+  /// launch (or was never recorded — every build predating the marker), a prior
+  /// Accessibility grant is pinned to the old designated requirement and `tccd`
+  /// will keep reporting this binary as untrusted ("toggle on, still denied").
+  /// Reset the grant once so the normal wizard grant flow recaptures a matching
+  /// requirement. Runs before the wizard's first permission check. Persists the new
+  /// identity only on a successful reset, so a failed reset retries next launch
+  /// instead of being masked.
+  ///
+  /// What still moves the requirement, now that debug builds carry their own
+  /// bundle id and so can't inherit a release's rows: a **re-issued Developer ID
+  /// certificate**, which changes the leaf a release's default requirement names
+  /// and orphans every installed user's grant at once. Signing can't pre-empt it —
+  /// the requirement a shipped copy handed to `tccd` predates the rotation.
   private func runAccessibilityGrantMigration() {
-    let key = SigningIdentityMigration.lastSigningTeamDefaultsKey
+    let key = SigningIdentityMigration.lastSigningIdentityDefaultsKey
     let defaults = UserDefaults.standard
     let persist = SigningIdentityMigration.run(
-      lastTeam: defaults.string(forKey: key),
-      currentTeam: SigningIdentity.currentTeamIdentifier(),
+      lastIdentity: defaults.string(forKey: key),
+      currentIdentity: SigningIdentity.current(),
       isTrusted: AXIsProcessTrusted(),
-      reset: { SigningIdentity.resetAccessibilityGrant(bundleID: BlurtIdentity.subsystem) }
+      // The *running* bundle id, not `HostIdentity.current.subsystem`: debug builds ship
+      // under `dev.alex.blurt.dev` (see `project.yml`), and resetting the constant
+      // would clear the released Blurt's grant from a dev build — the one app
+      // whose permissions this process has no business touching. The constant is
+      // the fallback for the unreachable case of a bundle with no id at all.
+      reset: {
+        SigningIdentity.resetAccessibilityGrant(
+          bundleID: Bundle.main.bundleIdentifier ?? HostIdentity.current.subsystem)
+      }
     )
     if let persist { defaults.set(persist, forKey: key) }
   }
