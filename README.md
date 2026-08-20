@@ -98,9 +98,9 @@ utterance.
   so it still reaches whatever app you're in.
 - **Quiets your music** — start dictating and Spotify or Apple Music pauses,
   then resumes the moment you stop. Only ever pauses a player that's already
-  playing, so it can't start music you didn't ask for. Browsers can't report
-  whether they're playing, so covering YouTube is an opt-in setting that sends a
-  play/pause key instead.
+  playing, so it can't start music you didn't ask for. Browser audio isn't
+  covered: nothing on macOS will tell an app whether a browser tab is playing,
+  and pausing blindly would start playback as often as it stopped it.
 - **Live feedback** — a floating overlay pill shows a real-time mic level
   meter and the pipeline phase; a menu bar indicator mirrors it from anywhere.
 - **Actual synth cues** — start and stop can be cued by real Yamaha DX7 or

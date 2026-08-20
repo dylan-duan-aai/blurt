@@ -65,7 +65,6 @@ enum UITestIdentifiers {
   static let developerToggle = "settings.developer.toggle"
   static let enhancedTranscriptsToggle = "settings.enhancedTranscripts.toggle"
   static let pauseMediaToggle = "settings.pauseMedia.toggle"
-  static let pauseOtherMediaToggle = "settings.pauseOtherMedia.toggle"
   static let updateCheck = "settings.update.check"
 
   /// The dictation overlay pill (`OverlayView`).

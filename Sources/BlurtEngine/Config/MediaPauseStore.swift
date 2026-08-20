@@ -1,33 +1,24 @@
 import Foundation
 
-/// Persists the two "quiet the music while dictating" switches in `UserDefaults`.
-/// The Settings window's Transcription section flips them. Music bleeding into the
-/// microphone is the transcript's problem, not just the listener's.
+/// Persists the "pause music while dictating" switch in `UserDefaults`. On by
+/// default; the Settings window's Transcription section flips it. Music bleeding
+/// into the microphone is the transcript's problem, not just the listener's.
 ///
-/// Two switches rather than one, because the two mechanisms have genuinely
-/// different risk profiles and only the user can judge the second:
+/// Scoped to the players that can be paused *precisely*: `MediaPlayerApp` entries
+/// expose `player state`, so a dictation acts only on one that is already playing
+/// and resumes only what it paused. Nothing can start unbidden, which is what makes
+/// it safe to default on.
 ///
-/// - `isEnabled` (**on** by default) drives the *precise* path. The scriptable
-///   players (`MediaPlayerApp`) expose `player state`, so we act only on one that
-///   is already playing and resume only what we paused. Nothing can start
-///   unbidden, which is what makes it safe to default on.
-/// - `includesOtherPlayers` (**off** by default) drives the *imprecise* path: a
-///   system play/pause media key, the only thing that reaches a browser playing
-///   YouTube. It is a stateless toggle, and macOS offers no public way to ask
-///   whether a browser is playing — the device-level CoreAudio flag reads busy
-///   even in silence, per-process output state needs system-audio-recording
-///   consent, and MediaRemote is gated for unentitled apps. So with nothing
-///   actually playing it can *start* a player, and it desyncs if the user touches
-///   playback mid-dictation. Off by default so that failure mode is opted into
-///   rather than imposed.
+/// **Browsers are deliberately not covered** — see `MediaPlayerApp` for the three
+/// detection routes that were measured and rejected, and for the blind media-key
+/// fallback that was built, tested, and removed. Don't add a switch for it back.
 ///
-/// The host reads both at the start of each dictation, so a change applies to the
+/// The host reads this at the start of each dictation, so a change applies to the
 /// very next one. Same shape as `EnhancedTranscriptsStore` / `DeveloperModeStore`.
 public struct MediaPauseStore {
-  /// UserDefaults keys. Public so SwiftUI views can observe them directly (e.g.
-  /// `@AppStorage`) and re-render on change.
+  /// UserDefaults key holding the switch. Public so SwiftUI views can observe it
+  /// directly (e.g. `@AppStorage`) and re-render on change.
   public static let defaultsKey = "BlurtPauseMediaWhileDictating"
-  public static let otherPlayersDefaultsKey = "BlurtPauseOtherMediaWhileDictating"
 
   private let defaults: UserDefaults
 
@@ -47,13 +38,6 @@ public struct MediaPauseStore {
     get { defaults.object(forKey: Self.defaultsKey) as? Bool ?? true }
     nonmutating set { defaults.set(newValue, forKey: Self.defaultsKey) }
   }
-
-  /// Unset means **off** — the plain `bool(forKey:)` shape. This switch can
-  /// misfire (see the type doc), so it must never end up on by accident.
-  public var includesOtherPlayers: Bool {
-    get { defaults.bool(forKey: Self.otherPlayersDefaultsKey) }
-    nonmutating set { defaults.set(newValue, forKey: Self.otherPlayersDefaultsKey) }
-  }
 }
 
 /// A media player Blurt can pause *precisely*, because it exposes playback state
@@ -66,6 +50,27 @@ public struct MediaPauseStore {
 /// `spfyPaus`/`spfyPlay`, Apple Music's `hookPaus`/`hookPlay`, both exposing
 /// `player state` as `pPlS`), and each one costs the user another
 /// automation-consent prompt.
+///
+/// ## Why browsers (YouTube) are not here, and shouldn't be added
+///
+/// Pausing safely requires *knowing* something is playing — otherwise "pause"
+/// starts music the user never asked for. No public API answers that for a browser.
+/// All three routes were measured on macOS 26 and rejected:
+///
+/// - **CoreAudio, device level** (`kAudioDevicePropertyDeviceIsRunningSomewhere`):
+///   read `true` with the app quit and total silence. Useless.
+/// - **CoreAudio, per process** (`kAudioProcessPropertyIsRunningOutput`, public
+///   since macOS 14.4): enumerates processes, but reports nothing for *other*
+///   processes without system-audio-recording consent — a far heavier permission
+///   than the feature is worth, and worse UX than the automation prompt.
+/// - **MediaRemote** (`MRMediaRemoteGetNowPlayingApplicationIsPlaying`): private,
+///   and now gated — it returned `false` while Spotify was demonstrably playing.
+///
+/// A blind system play/pause media key (the only thing that *reaches* a browser)
+/// was therefore built as an opt-in fallback, tested, and **removed**: with no way
+/// to check state it toggles rather than pauses, so it starts playback that wasn't
+/// running and desyncs on resume. That was confirmed in real use, not just in
+/// theory. Don't reintroduce it without a state source that actually works.
 public enum MediaPlayerApp: String, CaseIterable, Sendable {
   /// The name the scripting interface is addressed by — also the name macOS shows
   /// in its "Blurt wants to control …" consent prompt.

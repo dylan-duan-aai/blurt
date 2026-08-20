@@ -19,11 +19,8 @@ struct PersistedSettingsTests {
     // "clean" install pasting verbatim transcripts.
     #expect(PersistedSettings.allDefaultsKeys.contains(EnhancedTranscriptsStore.defaultsKey))
     // The media-pause switch also defaults to ON, so the same argument applies: a
-    // stray `false` surviving a reset would silently stop pausing the music. Its
-    // opt-in companion defaults to OFF, and a stray `true` there would fire blind
-    // media keys on a "clean" install.
+    // stray `false` surviving a reset would silently stop pausing the music.
     #expect(PersistedSettings.allDefaultsKeys.contains(MediaPauseStore.defaultsKey))
-    #expect(PersistedSettings.allDefaultsKeys.contains(MediaPauseStore.otherPlayersDefaultsKey))
     // OverlayOriginStore persists a point, so it contributes two keys rather
     // than one. Both belong to the sweep: while they were private to
     // `OverlayWindowController`, no reset knew about them and a pill dragged
@@ -37,11 +34,10 @@ struct PersistedSettingsTests {
 
   @Test("the roster carries no stale or duplicate keys")
   func rosterHasNoStrays() {
-    // Exactly the eight known stores' keys (OverlayOriginStore and MediaPauseStore
-    // each contribute two):
+    // Exactly the eight known stores' keys (OverlayOriginStore contributes two):
     // a removed store must leave the roster in the same change, and a key listed
     // twice would hint at a copy-paste slip.
-    #expect(PersistedSettings.allDefaultsKeys.count == 10)
+    #expect(PersistedSettings.allDefaultsKeys.count == 9)
     #expect(Set(PersistedSettings.allDefaultsKeys).count == PersistedSettings.allDefaultsKeys.count)
   }
 

@@ -422,9 +422,8 @@ Engine-side stores, all `UserDefaults`-backed value types with the same shape:
   `keyTermsProvider`), **`DeveloperModeStore`** (`BlurtDeveloperMode`, off by default),
   **`EnhancedTranscriptsStore`** (`BlurtEnhancedTranscripts`, **on** by default — unset reads as
   enabled; gates the dictation request's `llm` cleanup-rewrite block, re-read at every request),
-  **`MediaPauseStore`** (two keys: `BlurtPauseMediaWhileDictating`, **on** by default — unset reads as
-  enabled; and `BlurtPauseOtherMediaWhileDictating`, **off** by default — the plain `bool(forKey:)`
-  shape, because that switch can misfire. Both re-read on every recording edge),
+  **`MediaPauseStore`** (`BlurtPauseMediaWhileDictating`, **on** by default — unset reads as enabled;
+  gates pausing Spotify/Apple Music while recording, re-read on every recording edge),
   **`OverlayOriginStore`** (the pill's dragged origin, x/y), **`LastUpdateCheckStore`**
   (`BlurtLastUpdateCheck`, the stamp throttling the automatic launch update check).
 - **`PersistedSettings.allDefaultsKeys`** is the roster of every key those stores write, and
@@ -451,51 +450,50 @@ they want identical edges, so the edge logic exists once. Note `.ended` fires wh
 not at a terminal phase: anything suppressed for the microphone's benefit is restored as recording
 stops, not a second later when the paste lands.
 
-Music: **`MediaPauseController`** (`App/Blurt/Blurt/`) quiets the user's music while the mic is open
-and restores it on `.ended`, so what you're listening to stays out of the transcript. Driven from
-`AppCoordinator.render(_:)` exactly like the chimes. **Two mechanisms, deliberately unequal:**
+Music: **`MediaPauseController`** (`App/Blurt/Blurt/`) pauses the user's music while the mic is open and
+restores it on `.ended`, so what they're listening to stays out of the transcript. Driven from
+`AppCoordinator.render(_:)` exactly like the chimes.
 
-1. **Scriptable players** — `MediaPlayerApp` (Spotify, Apple Music), on by default. Both expose
-   `player state` over one shared script shape, so we pause only a player that is _already playing_ and
-   resume only what we paused (tracked on the controller's serial queue, not against the setting, so
-   flipping the toggle off mid-dictation can't strand the music paused). `if application … is running`
-   is the idiom that reads the running state _without_ launching the app — a dictation must never boot a
-   music player. Because it cannot start anything unbidden, it's safe on by default.
-2. **A system play/pause media key** — off by default. The only thing that reaches a browser playing
-   YouTube, but a stateless toggle, so with nothing actually playing it can _start_ a player. Only
-   fires when the precise path found nothing (if Spotify was playing we already handled it exactly, and
-   a toggle on top would resume it mid-dictation).
+Scoped to **scriptable players** — `MediaPlayerApp` (Spotify, Apple Music), on by default. Both expose
+`player state` through one shared script shape, so a dictation pauses only a player that is _already
+playing_ and resumes only what it paused (tracked on the controller's serial queue, not against the
+setting, so flipping the toggle off mid-dictation can't strand the music paused). `if application … is
+running` is the idiom that reads the running state _without_ launching the app — a dictation must never
+boot a music player. Because it cannot start anything unbidden, it's safe on by default.
 
-**Why there is no state-aware option for browsers** — all three alternatives were measured and rejected,
-so don't re-litigate this without new evidence: CoreAudio's device-level
-`kAudioDevicePropertyDeviceIsRunningSomewhere` reads busy even in total silence with the app quit;
-per-process `kAudioProcessPropertyIsRunningOutput` (public, macOS 14.4+) reports nothing for other
-processes without system-audio-recording consent — too heavy a permission for pausing music; and
-MediaRemote (`MRMediaRemoteGetNowPlayingApplicationIsPlaying`) is gated for unentitled apps, returning
-`false` while Spotify was demonstrably playing. Hence the honest split above.
+**Browsers are deliberately not covered — don't "fix" this.** Pausing safely needs to know something is
+playing, and no public API answers that for a browser. All three routes were measured on macOS 26 and
+rejected: CoreAudio's device-level `kAudioDevicePropertyDeviceIsRunningSomewhere` reads busy with the app
+quit and total silence; per-process `kAudioProcessPropertyIsRunningOutput` (public since 14.4) reports
+nothing for other processes without system-audio-recording consent, a far heavier permission than the
+feature is worth; and MediaRemote (`MRMediaRemoteGetNowPlayingApplicationIsPlaying`) is gated for
+unentitled apps, returning `false` while Spotify was demonstrably playing. A blind system play/pause
+media key — the only thing that _reaches_ a browser — was built as an opt-in fallback, shipped to a
+tester, and **removed**: with no state to read it toggles rather than pauses, so it started playback that
+wasn't running. That was confirmed in real use, not theory. `MediaPlayerApp`'s doc carries the same
+warning next to the code.
 
-The scripts run in a short-lived **`/usr/bin/osascript` child process**, not in-process
-`NSAppleScript` — and that is a correctness requirement, not a style choice. In-process OSA leaks
-internally per invocation: `scripts/leaks.sh` failed twice on backtraces through
-`executeAndReturnError`, an `autoreleasepool` did **not** help (the second failure's backtrace ran
-straight through the pool), and the leak never reproduced on a dev machine, only on CI — so there was no
-way to validate an in-process fix. Running it in a child makes it structural: the OSA allocations die
-with `osascript`, so no Blurt frame can appear in a leak backtrace. `Process` against a system binary is
-already established here (`SigningIdentity` shells out to `tccutil`). TCC still attributes the event to
-Blurt as the **responsible process**, so the prompt names Blurt and reads its
-`NSAppleEventsUsageDescription`.
+The scripts run in a short-lived **`/usr/bin/osascript` child process**, not in-process `NSAppleScript` —
+a correctness requirement, not a style choice. In-process OSA leaks internally per invocation:
+`scripts/leaks.sh` failed twice on backtraces through `executeAndReturnError`, an `autoreleasepool` did
+**not** help (the second failure's backtrace ran straight through the pool), and the leak never
+reproduced on a dev machine, only on CI — so there was no way to validate an in-process fix. Running it
+in a child makes it structural: the OSA allocations die with `osascript`, so no Blurt frame can appear in
+a leak backtrace. `Process` against a system binary is already established here (`SigningIdentity` shells
+out to `tccutil`). TCC still attributes the event to Blurt as the **responsible process**, so the prompt
+names Blurt and reads its `NSAppleEventsUsageDescription`.
 
 One `osascript` per recording edge, not one per player: AppleScript cannot take app-specific terminology
 like `player state` through a variable application reference, so both players are unrolled into one
 generated script, each block wrapped in `try` so an uninstalled app (Spotify on CI) can't abort the
-others. The invocations sit on a **serial `DispatchQueue`** so the restore always observes what the
-pause did — on a concurrent queue a short dictation's restore could overtake its own pause and see
-nothing to resume, leaving the music stopped. The whole thing is fire-and-forget, so a wedged player can
-never delay a recording. Sending Apple Events at all needs **two** build-side pieces, both in
-`project.yml`: `NSAppleEventsUsageDescription` (without it macOS _terminates_ the process on the first
-send instead of prompting) and the `com.apple.security.automation.apple-events` entitlement (the
-hardened runtime, which Blurt ships with, otherwise blocks outgoing events). A user who declines the
-consent prompt just gets a logged `-1743` and an inert feature.
+others. The invocations sit on a **serial `DispatchQueue`** so the restore always observes what the pause
+did — on a concurrent queue a short dictation's restore could overtake its own pause and see nothing to
+resume, leaving the music stopped. The whole thing is fire-and-forget, so a wedged player can never delay
+a recording. Sending Apple Events at all needs **two** build-side pieces, both in `project.yml`:
+`NSAppleEventsUsageDescription` (without it macOS _terminates_ the process on the first send instead of
+prompting) and the `com.apple.security.automation.apple-events` entitlement (the hardened runtime, which
+Blurt ships with, otherwise blocks outgoing events). A user who declines the consent prompt just gets a
+logged `-1743` and an inert feature.
 
 History: **`RecentDictations`** is an in-memory, newest-first ring shown in the ready window (never
 written to disk). **`DictationLog`** appends each completed dictation with its context snapshot to

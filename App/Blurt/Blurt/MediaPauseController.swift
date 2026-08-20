@@ -1,4 +1,3 @@
-import AppKit
 import BlurtEngine
 import Foundation
 import os
@@ -14,18 +13,16 @@ import os
 /// phase, so playback returns the moment the mic closes instead of a second later
 /// when the paste lands.
 ///
-/// Two mechanisms, deliberately unequal (see `MediaPauseStore` for the switches):
+/// Only the scriptable players (`MediaPlayerApp`: Spotify, Apple Music) are touched,
+/// and only *precisely*: each exposes `player state`, so we pause one that is
+/// already playing and resume only what we actually paused. `if application … is
+/// running` is the scripting idiom that reads the running state *without* launching
+/// the app, which matters — a dictation must never boot a music player. Because it
+/// cannot start anything unbidden, the switch defaults on.
 ///
-/// 1. **Scriptable players** (`MediaPlayerApp`: Spotify, Apple Music) — precise.
-///    Each exposes `player state`, so we pause only one that is *already playing*
-///    and resume only what we actually paused. `if application … is running` is the
-///    scripting idiom that reads the running state *without* launching the app,
-///    which matters: a dictation must never boot a music player. On by default,
-///    because it cannot start anything unbidden.
-/// 2. **A system play/pause media key** — imprecise, off by default. The only thing
-///    that reaches a browser playing YouTube, but a stateless toggle: macOS exposes
-///    no public way to ask whether a browser is playing, so this can *start*
-///    something when nothing was. Gated behind `includesOtherPlayers`.
+/// Browsers are deliberately out of scope; `MediaPlayerApp` documents the detection
+/// routes that were measured and rejected, and the blind media-key fallback that was
+/// built, tested in real use, and removed for toggling rather than pausing.
 ///
 /// ## Why the scripts run in `/usr/bin/osascript` rather than `NSAppleScript`
 ///
@@ -79,10 +76,6 @@ final class MediaPauseController {
   /// actor; the ordering guarantee is the whole reason it lives here.
   nonisolated(unsafe) private var pausedPlayers: [MediaPlayerApp] = []
 
-  /// Whether we sent the imprecise media key and therefore owe a second one. Same
-  /// queue-confinement contract as `pausedPlayers`.
-  nonisolated(unsafe) private var sentMediaKey = false
-
   /// Acts on the recording edge. Call once per rendered phase.
   func transition(for phase: PipelinePhase) {
     switch edges.edge(for: phase) {
@@ -90,9 +83,8 @@ final class MediaPauseController {
       // Read the settings on the main actor, at the edge, so a Settings change
       // applies to the very next dictation — the same freshness rule as the
       // press-time key-terms read.
-      let settings = MediaPauseStore()
-      guard settings.isEnabled else { return }
-      pause(includingOtherPlayers: settings.includesOtherPlayers)
+      guard MediaPauseStore().isEnabled else { return }
+      pause()
     case .ended:
       restore()
     case nil:
@@ -103,29 +95,19 @@ final class MediaPauseController {
   /// Enqueues the pause. Fire-and-forget: recording has already started and must
   /// never wait on another app's responsiveness, so a slow or wedged player costs
   /// at most some music bleeding into the first moments of the take.
-  private func pause(includingOtherPlayers: Bool) {
+  private func pause() {
     Self.queue.async { [self] in
       // Assigned, not appended: a stale entry from an earlier dictation whose
       // restore was skipped must not resurrect playback the user has since stopped.
       pausedPlayers = Self.pausePlayingPlayers()
-      // Only worth a media key if the precise path found nothing. If Spotify was
-      // the thing playing we already handled it exactly, and firing a toggle on top
-      // would resume it mid-dictation.
-      sentMediaKey = includingOtherPlayers && pausedPlayers.isEmpty
-      if sentMediaKey { Self.postPlayPauseKey() }
     }
   }
 
   private func restore() {
     Self.queue.async { [self] in
-      if !pausedPlayers.isEmpty {
-        Self.resume(pausedPlayers)
-        pausedPlayers = []
-      }
-      if sentMediaKey {
-        sentMediaKey = false
-        Self.postPlayPauseKey()
-      }
+      guard !pausedPlayers.isEmpty else { return }
+      Self.resume(pausedPlayers)
+      pausedPlayers = []
     }
   }
 
@@ -173,31 +155,6 @@ final class MediaPauseController {
       """
     }
     _ = runOSA(blocks.joined(separator: "\n"))
-  }
-
-  /// Virtual keycode for the system play/pause media key (`NX_KEYTYPE_PLAY`).
-  private nonisolated static let playPauseKey: Int = 16
-
-  /// Posts a system play/pause media key: a `systemDefined` event with subtype 8,
-  /// which is how the hardware media keys are represented — a plain `CGEvent`
-  /// keycode cannot express them. It reaches whichever app owns the current media
-  /// session, which is exactly why it covers browsers.
-  ///
-  /// Needs no permission Blurt lacks: it already posts synthetic events for the
-  /// clipboard paste (see `KeyInjector`), so the Accessibility grant covers this.
-  private nonisolated static func postPlayPauseKey() {
-    for isDown in [true, false] {
-      let data1 = (playPauseKey << 16) | (isDown ? 0x0A00 : 0x0B00)
-      guard
-        let event = NSEvent.otherEvent(
-          with: .systemDefined, location: .zero, modifierFlags: [], timestamp: 0,
-          windowNumber: 0, context: nil, subtype: 8, data1: data1, data2: -1)
-      else {
-        logger.error("failed to build media key event")
-        return
-      }
-      event.cgEvent?.post(tap: .cghidEventTap)
-    }
   }
 
   /// Runs `source` through `/usr/bin/osascript`, returning trimmed stdout (nil when

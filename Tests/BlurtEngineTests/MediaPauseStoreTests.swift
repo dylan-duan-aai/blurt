@@ -5,32 +5,21 @@ import Testing
 
 @Suite("MediaPauseStore")
 struct MediaPauseStoreTests {
-  @Test("the precise pause defaults to on when unset")
+  @Test("the pause defaults to on when unset")
   func pauseDefaultsToOn() {
     // Quieting the music you're dictating over is the useful default, and the
     // scripted path can't start anything unbidden, so it's safe to default on.
     #expect(MediaPauseStore(defaults: freshDefaults()).isEnabled)
   }
 
-  @Test("the imprecise media key defaults to OFF when unset")
-  func otherPlayersDefaultsToOff() {
-    // This one fires a blind play/pause toggle, which can start playback that
-    // wasn't running. It must never be on by accident.
-    #expect(!MediaPauseStore(defaults: freshDefaults()).includesOtherPlayers)
-  }
-
-  @Test("both switches persist and read back independently")
+  @Test("the switch persists and reads back")
   func roundTrips() {
     let defaults = freshDefaults()
     let store = MediaPauseStore(defaults: defaults)
     store.isEnabled = false
-    store.includesOtherPlayers = true
     #expect(!MediaPauseStore(defaults: defaults).isEnabled)
-    #expect(MediaPauseStore(defaults: defaults).includesOtherPlayers)
     store.isEnabled = true
-    store.includesOtherPlayers = false
     #expect(MediaPauseStore(defaults: defaults).isEnabled)
-    #expect(!MediaPauseStore(defaults: defaults).includesOtherPlayers)
   }
 
   @Test("an explicit opt-out survives, rather than reading back as the default")
