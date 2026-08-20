@@ -22,7 +22,9 @@ struct CancelRaceTests {
     let mic = StubMicCapture()
     let stt = GatedTranscriber(text: "Hello world.")
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     await session.press()
     await session.release()  // -> .transcribing, spawns the pipeline task
@@ -51,7 +53,9 @@ struct CancelRaceTests {
     // reported as a fault) over the .cancelled the cancel() already claimed.
     let stt = GatedTranscriber(text: "Hello world.", throwsWhenCancelled: true)
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     await session.press()
     await session.release()
@@ -75,7 +79,9 @@ struct CancelRaceTests {
       let mic = StubMicCapture()
       let stt = StubTranscriber(mode: .transcript("Hello world."))
       let injector = GatedInjector(onRecord: { pasted() })
-      let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+      let session = DictationSession(
+        mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+        seams: .offline)
 
       await session.press()
       await session.release()
@@ -98,7 +104,9 @@ struct CancelRaceTests {
     let mic = GatedStopMic()
     let stt = StubTranscriber(mode: .transcript("Hello world."))
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     await session.press()
     #expect(await session.phase == .recording)
@@ -125,7 +133,9 @@ struct CancelRaceTests {
     let mic = GatedStopMic(stopError: URLError(.unknown))
     let stt = StubTranscriber(mode: .transcript("Hello world."))
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     await session.press()
     let releaseTask = Task { await session.release() }
@@ -144,12 +154,33 @@ struct CancelRaceTests {
     #expect(await injector.inserted.isEmpty)
   }
 
+  /// The other failing-stop route: cancelling a live recording, where
+  /// `stopAndCancel` tears the mic down. The error is recorded for developer mode
+  /// (`DictationLog.appendError`) rather than dropped, but it must stay out of the
+  /// UI — the user asked for nothing to happen, so the phase is still `.cancelled`
+  /// and no transcript is produced.
+  @Test("cancel of a live recording survives a failing mic.stop")
+  func cancelDuringRecordingSurvivesFailingMicStop() async throws {
+    let fixture = makeSession()
+    await fixture.mic.setStopError(URLError(.unknown))
+
+    await fixture.session.press()
+    #expect(await fixture.session.phase == .recording)
+    await fixture.session.cancel()
+
+    #expect(await fixture.session.phase == .cancelled)
+    #expect(await fixture.mic.stopCalls == 1)
+    #expect(await fixture.injector.inserted.isEmpty)
+  }
+
   @Test("cancelRecording during transcribing leaves the pipeline alone")
   func cancelRecordingDoesNotTearDownTranscribing() async throws {
     let mic = StubMicCapture()
     let stt = GatedTranscriber(text: "Hello world.")
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     await session.press()
     await session.release()  // -> .transcribing, spawns the pipeline task
@@ -171,17 +202,14 @@ struct CancelRaceTests {
 
   @Test("cancelRecording during recording cancels like cancel()")
   func cancelRecordingCancelsLiveRecording() async throws {
-    let mic = StubMicCapture()
-    let stt = StubTranscriber(mode: .transcript("Hello world."))
-    let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let fixture = makeSession()
 
-    await session.press()
-    #expect(await session.phase == .recording)
-    await session.cancelRecording()
-    #expect(await session.phase == .cancelled)
-    #expect(await mic.stopCalls == 1)
-    #expect(await injector.inserted.isEmpty)
+    await fixture.session.press()
+    #expect(await fixture.session.phase == .recording)
+    await fixture.session.cancelRecording()
+    #expect(await fixture.session.phase == .cancelled)
+    #expect(await fixture.mic.stopCalls == 1)
+    #expect(await fixture.injector.inserted.isEmpty)
   }
 
   @Test("cancel landing in insert's non-cancellable tail stays .cancelled, not .pasted")
@@ -192,7 +220,9 @@ struct CancelRaceTests {
     // check, once the paste has landed): insert returns *normally* even though
     // the task was cancelled mid-flight.
     let injector = GatedInjector(honorsCancellation: false)
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     await session.press()
     await session.release()
@@ -220,7 +250,8 @@ struct CancelRaceTests {
     // the timer simply hasn't elapsed in wall-clock time.
     let clock = TestClock()
     let session = DictationSession(
-      mic: mic, transcriber: stt, injector: injector, maxRecordingSeconds: 0.05, clock: clock)
+      mic: mic, transcriber: stt, injector: injector, maxRecordingSeconds: 0.05, clock: clock,
+      keyTermsProvider: { [] }, seams: .offline)
 
     await session.press()
     #expect(await session.phase == .recording)
@@ -271,7 +302,7 @@ private actor GatedTranscriber: TranscriberProtocol {
   }
 
   func waitUntilStarted() async { await gate.waitUntilEntered() }
-  func allowToFinish() async { await gate.allowToFinish() }
+  func allowToFinish() async { gate.allowToFinish() }
 }
 
 /// Injector stub that honors task cancellation (like the real `KeyInjector`) and
@@ -302,5 +333,5 @@ private actor GatedInjector: InjectorProtocol {
   }
 
   func waitUntilInsertEntered() async { await gate.waitUntilEntered() }
-  func allowInsertToFinish() async { await gate.allowToFinish() }
+  func allowInsertToFinish() async { gate.allowToFinish() }
 }

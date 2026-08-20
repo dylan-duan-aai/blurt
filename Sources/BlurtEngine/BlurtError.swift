@@ -19,6 +19,51 @@ public enum BlurtError: Error, Sendable {
   case noEditableTarget
 }
 
+extension BlurtError {
+  /// Stable, machine-greppable case label for the developer-mode error log
+  /// (`DictationLog.appendError`). Distinct from `errorDescription`, which is
+  /// human-facing copy that carries a localized underlying description — fine to
+  /// read, useless to aggregate on, and free to be reworded. This is the field a
+  /// `grep '"kind":"sttFailed"' errors.jsonl` counts.
+  ///
+  /// Exhaustive for the same reason as `isSetupBlocker`: a new case must not
+  /// silently land in the log under a neighbour's name.
+  var diagnosticName: String {
+    switch self {
+    case .accessibilityPermissionMissing: "accessibilityPermissionMissing"
+    case .apiKeyMissing: "apiKeyMissing"
+    case .sttFailed: "sttFailed"
+    case .targetAppLost: "targetAppLost"
+    case .audioCaptureFailed: "audioCaptureFailed"
+    case .noEditableTarget: "noEditableTarget"
+    }
+  }
+
+  /// Whether an error *thrown by the injector* means "transcription worked, the
+  /// words just couldn't be pasted, and they're on the clipboard" — which the
+  /// pipeline shows as the quiet `.noTarget` notice instead of the red error
+  /// flash, and deliberately keeps out of `errors.jsonl`.
+  ///
+  /// Exhaustive for the same reason as `isSetupBlocker` and `diagnosticName`.
+  /// `DictationSession`'s inject `catch` used to re-derive this by listing the two
+  /// quiet cases in its own `switch`, which is not exhaustive over `BlurtError`:
+  /// the next error that leaves the text on the clipboard (paste blocked by Secure
+  /// Input, a sandboxed pasteboard denial) would have fallen through to the red
+  /// flash and been reported as a fault, with nothing failing to say so.
+  ///
+  /// Note this classifies the error the injector *threw*. The session's own
+  /// relabeling of an **untyped** injection error reuses `.targetAppLost` for its
+  /// description while staying a genuine reported failure — nothing was copied
+  /// there — so that path constructs `.failed(.targetAppLost)` directly rather
+  /// than routing through this property. See the case's own doc above.
+  var isQuietDegradation: Bool {
+    switch self {
+    case .noEditableTarget, .targetAppLost: true
+    case .accessibilityPermissionMissing, .apiKeyMissing, .sttFailed, .audioCaptureFailed: false
+    }
+  }
+}
+
 extension BlurtError: LocalizedError {
   public var errorDescription: String? {
     switch self {

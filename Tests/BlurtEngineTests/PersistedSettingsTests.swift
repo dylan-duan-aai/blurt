@@ -18,6 +18,7 @@ struct PersistedSettingsTests {
     // the other direction too: a stray `false` surviving a reset would leave a
     // "clean" install pasting verbatim transcripts.
     #expect(PersistedSettings.allDefaultsKeys.contains(EnhancedTranscriptsStore.defaultsKey))
+    #expect(PersistedSettings.allDefaultsKeys.contains(CustomStyleStore.defaultsKey))
     // The media-pause switch also defaults to ON, so the same argument applies: a
     // stray `false` surviving a reset would silently stop pausing the music.
     #expect(PersistedSettings.allDefaultsKeys.contains(MediaPauseStore.defaultsKey))
@@ -34,11 +35,37 @@ struct PersistedSettingsTests {
 
   @Test("the roster carries no stale or duplicate keys")
   func rosterHasNoStrays() {
-    // Exactly the eight known stores' keys (OverlayOriginStore contributes two):
+    // Exactly the nine known stores' keys (OverlayOriginStore contributes two):
     // a removed store must leave the roster in the same change, and a key listed
     // twice would hint at a copy-paste slip.
-    #expect(PersistedSettings.allDefaultsKeys.count == 9)
+    #expect(PersistedSettings.allDefaultsKeys.count == 10)
     #expect(Set(PersistedSettings.allDefaultsKeys).count == PersistedSettings.allDefaultsKeys.count)
+  }
+
+  /// The roster is `DefaultsKey.allCases`, so the interesting question is no longer
+  /// "did someone forget the roster" — it's whether the enum and the stores still
+  /// describe the same set. This fails in both directions: a case no store claims
+  /// (a key swept but never written, i.e. dead), and a store whose key isn't a case
+  /// (a reintroduced string literal, which would drop straight back out of the
+  /// sweep — the bug the enum exists to make impossible).
+  @Test("every DefaultsKey case is claimed by exactly one store")
+  func casesAndStoresDescribeTheSameSet() {
+    let storeKeys: Set<String> = [
+      TriggerKeyStore.defaultsKey,
+      SoundPackStore.defaultsKey,
+      KeyTermsStore.defaultsKey,
+      DeveloperModeStore.defaultsKey,
+      EnhancedTranscriptsStore.defaultsKey,
+      CustomStyleStore.defaultsKey,
+      MediaPauseStore.defaultsKey,
+      OverlayOriginStore.xDefaultsKey,
+      OverlayOriginStore.yDefaultsKey,
+      LastUpdateCheckStore.defaultsKey,
+    ]
+    #expect(storeKeys == Set(DefaultsKey.allCases.map(\.key)))
+    // No two stores sharing a slot — the Set above would have quietly absorbed a
+    // collision, and two stores on one key means each overwrites the other.
+    #expect(storeKeys.count == 10)
   }
 
   @Test("resetAll clears every roster key and leaves unrelated ones alone")
@@ -47,15 +74,17 @@ struct PersistedSettingsTests {
     for key in PersistedSettings.allDefaultsKeys {
       defaults.set("stale", forKey: key)
     }
-    // The signing-team marker is deliberately outside the roster — it records what
-    // the TCC migration has already done, and clearing it would re-run the reset.
-    defaults.set("TEAMID", forKey: SigningIdentityMigration.lastSigningTeamDefaultsKey)
+    // The signing-identity marker is deliberately outside the roster — it records
+    // what the TCC migration has already done, and clearing it would re-run the
+    // reset.
+    defaults.set("TEAMID", forKey: SigningIdentityMigration.lastSigningIdentityDefaultsKey)
 
     PersistedSettings.resetAll(in: defaults)
 
     for key in PersistedSettings.allDefaultsKeys {
       #expect(defaults.object(forKey: key) == nil, "\(key) should have been cleared")
     }
-    #expect(defaults.string(forKey: SigningIdentityMigration.lastSigningTeamDefaultsKey) == "TEAMID")
+    #expect(
+      defaults.string(forKey: SigningIdentityMigration.lastSigningIdentityDefaultsKey) == "TEAMID")
   }
 }

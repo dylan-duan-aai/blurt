@@ -52,22 +52,26 @@ struct HTTPClientTests {
     #expect(result == expected)
   }
 
-  @Test("transcriber succeeds with a real context (builds and sends a prompt)")
+  @Test("transcriber succeeds with a real context (which builds context turns)")
   func transcribeWithContext() async throws {
     let transport = FakeHTTPTransport { request in
       guard request.url?.path.hasSuffix("/transcribe") == true else { return (404, Data()) }
       return (200, json(["text": "hello world"]))
     }
 
-    // A non-empty context exercises the TranscriptionPrompt.build path inside
-    // transcribe() that the nil-context happy path skips. The fake can't observe
-    // the multipart upload body, so this asserts the request still round-trips
-    // cleanly rather than the wire contents (covered directly by makeConfigData).
+    // A context with history and prior text exercises the
+    // `ConversationContext.turns` path inside transcribe() that the nil-context
+    // happy path skips, so the request goes out carrying a real
+    // `config.conversation_context`. The fake can't observe the multipart upload
+    // body, so this asserts the round trip rather than the wire contents (covered
+    // directly by makeConfigData).
     let result = try await makeTranscriber(apiKey: "test-key", transport: transport)
       .transcribe(
         pcm: Self.testPCM,
         sampleRate: 16_000,
-        context: TranscriptionContext(appName: "Slack", priorText: "Dear Sam,"))
+        context: TranscriptionContext(
+          appName: "Slack", priorText: "Dear Sam,",
+          recentTranscripts: ["Following up on yesterday."]))
     #expect(result == "hello world")
   }
 
@@ -154,42 +158,59 @@ struct HTTPClientTests {
     }
   }
 
-  @Test("config part carries the built context prompt")
-  func configIncludesPrompt() throws {
-    let object = try configObject(prompt: "CONTEXT. Transcribe.")
-    #expect(object["prompt"] as? String == "CONTEXT. Transcribe.")
+  @Test("config part carries the built context turns and the audio geometry")
+  func configIncludesConversationContext() throws {
+    let object = try configObject(turns: ["Previous utterance.", "at the cursor"])
+    #expect(object["conversation_context"] as? [String] == ["Previous utterance.", "at the cursor"])
     #expect(object["sample_rate"] as? Int == 16_000)
     // The capture path is mono by construction; the declared geometry must agree.
     #expect(object["channels"] as? Int == 1)
   }
 
   @Test(
-    "config part requests the default cleanup rewrite while enhanced transcripts are on",
-    arguments: ["CONTEXT. Transcribe.", nil])
-  func configRequestsDefaultRewrite(prompt: String?) throws {
-    // `llm` must be present and empty on every enhanced request: present so the
-    // service runs the rewrite at all, empty so the server-owned default cleanup
-    // instruction (and its guardrails) applies rather than a client-side copy.
-    // `isEmpty == true` also covers presence — it is false for a missing `llm`.
-    #expect((try configObject(prompt: prompt)["llm"] as? [String: Any])?.isEmpty == true)
+    "config part carries our cleanup instruction while enhanced transcripts are on",
+    arguments: [["at the cursor"], []])
+  func configRequestsRewrite(turns: [String]) throws {
+    // `llm` must be present on every enhanced request (else the service skips the
+    // rewrite) and must carry `instruction` under exactly that key — the field name
+    // is the contract, so a rename here degrades silently to the service default
+    // rather than failing anything. Sent with and without context, since the two
+    // fields are independent.
+    let llm = try #require(try configObject(turns: turns)["llm"] as? [String: Any])
+    #expect(llm["instruction"] as? String == CleanupInstruction.text)
+    // Nothing else rides in the block: output format and the don't-answer-the-text
+    // safeguards are the instruction's job and the service's, not extra fields'.
+    #expect(llm.keys.sorted() == ["instruction"])
+  }
+
+  @Test("config carries the custom style instructions appended to the cleanup instruction")
+  func configAppendsCustomStyle() throws {
+    let custom = "always write in lowercase"
+    let llm = try #require(try configObject(customStyle: custom)["llm"] as? [String: Any])
+    let instruction = try #require(llm["instruction"] as? String)
+    // The exact combination rule lives in `CleanupInstructionTests`; what this pins
+    // is the wiring — the transcriber's per-request read lands on the request, with
+    // the base instruction still leading.
+    #expect(instruction == CleanupInstruction.sendable(appending: custom))
+  }
+
+  @Test(
+    "a blank custom style leaves the cleanup instruction exactly as shipped",
+    arguments: [nil, "   \n"])
+  func configIgnoresBlankCustomStyle(customStyle: String?) throws {
+    let llm = try #require(try configObject(customStyle: customStyle)["llm"] as? [String: Any])
+    #expect(llm["instruction"] as? String == CleanupInstruction.text)
   }
 
   @Test("config part omits the llm block when enhanced transcripts are off")
   func configOmitsRewriteWhenDisabled() throws {
     // Omission — not an empty or null `llm` — is what tells the service to skip
     // the rewrite, so the user gets the verbatim transcript pasted as spoken.
-    let object = try configObject(prompt: "CONTEXT. Transcribe.", enhancedTranscripts: false)
+    let object = try configObject(turns: ["at the cursor"], enhancedTranscripts: false)
     #expect(object.keys.contains("llm") == false)
     // The rest of the config is unaffected by the switch.
     #expect(object["sample_rate"] as? Int == 16_000)
-    #expect(object["prompt"] as? String == "CONTEXT. Transcribe.")
-  }
-
-  @Test(
-    "config part omits the prompt field when there is no usable context",
-    arguments: [nil, "   \n"])
-  func configOmitsPrompt(prompt: String?) throws {
-    #expect(try configObject(prompt: prompt).keys.contains("prompt") == false)
+    #expect(object["conversation_context"] as? [String] == ["at the cursor"])
   }
 
   @Test("the multipart body frames the audio and config parts the dictation API expects")
@@ -304,17 +325,19 @@ struct HTTPClientTests {
 
   /// Builds a transcriber wired to `transport`. The default transport answers
   /// every request with a 500, for the cases that must never reach the wire.
-  /// Enhanced transcripts are pinned (on unless a test opts out) rather than
-  /// left to the production default, which reads the process's real
-  /// `UserDefaults`.
+  /// Enhanced transcripts and the custom style are pinned (on / none unless a
+  /// test opts out) rather than left to the production defaults, which read the
+  /// process's real `UserDefaults`.
   private func makeTranscriber(
     apiKey: String?,
     transport: any HTTPTransport = FakeHTTPTransport { _ in (500, Data()) },
-    enhancedTranscripts: Bool = true
+    enhancedTranscripts: Bool = true,
+    customStyle: String? = nil
   ) -> AssemblyAITranscriber {
     AssemblyAITranscriber(
       apiKeyProvider: { apiKey }, transport: transport,
-      enhancedTranscripts: { enhancedTranscripts })
+      enhancedTranscripts: { enhancedTranscripts },
+      customStyle: { customStyle })
   }
 
   private func collectTranscript(_ transcriber: AssemblyAITranscriber) async throws -> String {
@@ -325,9 +348,13 @@ struct HTTPClientTests {
   /// config assertion below wants, since `makeConfigData` returns raw JSON.
   /// A part that isn't a JSON object at all fails here rather than turning every
   /// downstream assertion into a silent nil-compare.
-  private func configObject(prompt: String?, enhancedTranscripts: Bool = true) throws -> [String: Any] {
-    let config = try makeTranscriber(apiKey: "test-key", enhancedTranscripts: enhancedTranscripts)
-      .makeConfigData(sampleRate: 16_000, prompt: prompt)
+  private func configObject(
+    turns: [String] = [], enhancedTranscripts: Bool = true, customStyle: String? = nil
+  ) throws -> [String: Any] {
+    let config = try makeTranscriber(
+      apiKey: "test-key", enhancedTranscripts: enhancedTranscripts, customStyle: customStyle
+    )
+    .makeConfigData(sampleRate: 16_000, conversationContext: turns, wordBoost: [])
     return try #require(JSONSerialization.jsonObject(with: config) as? [String: Any])
   }
 

@@ -67,15 +67,16 @@ private struct GeneralSettingsTab: View {
   }
 }
 
-/// The occasional stuff: the enhanced-transcripts switch, checking for an
-/// update, and the developer-mode log toggle. Kept out of General so the
-/// common pane stays short.
+/// The occasional stuff: the enhanced-transcripts switch, the custom style
+/// instructions, checking for an update, and the developer-mode log toggle.
+/// Kept out of General so the common pane stays short.
 private struct AdvancedSettingsTab: View {
   let updateModel: UpdateCheckModel
 
   var body: some View {
     SettingsPane {
       TranscriptionSection()
+      CustomStyleSection()
       UpdateSection(model: updateModel)
       DeveloperSection()
     }
@@ -97,8 +98,15 @@ private struct AdvancedSettingsTab: View {
 /// recording edge, so a change applies to the next dictation too.
 
 private struct TranscriptionSection: View {
-  @AppStorage(EnhancedTranscriptsStore.defaultsKey) private var enhancedTranscripts = true
-  @AppStorage(MediaPauseStore.defaultsKey) private var pauseMedia = true
+  // The unset default comes from the store, not a literal here: the transcriber
+  // reads the same slot per request, and two spellings of "unset means on" would let
+  // the toggle and the request disagree about an untouched install.
+  @AppStorage(EnhancedTranscriptsStore.defaultsKey)
+  private var enhancedTranscripts = EnhancedTranscriptsStore.defaultValue
+  // Same rule for the music switch: `MediaPauseController` reads this slot on every
+  // recording edge, so the default lives in the store rather than being restated here.
+  @AppStorage(MediaPauseStore.defaultsKey)
+  private var pauseMedia = MediaPauseStore.defaultValue
 
   var body: some View {
     Section {
@@ -119,6 +127,67 @@ private struct TranscriptionSection: View {
           + "Pausing music keeps what you're listening to out of the recording, and resumes it "
           + "when you stop. Applies to Spotify and Music, and only when one is already playing — "
           + "the first dictation asks your permission to control them.")
+    }
+  }
+}
+
+/// The Custom Style section of the Settings window: free-text style
+/// instructions appended to the cleanup instruction on every dictation request
+/// (see `CleanupInstruction.sendable(appending:)` / `CustomStyleStore`), so the
+/// enhanced-transcript polish also applies the user's formatting preferences.
+/// Optional — empty means the request is exactly what ships today. Disabled
+/// while enhanced transcripts are off, since the instruction it extends is not
+/// sent at all then.
+private struct CustomStyleSection: View {
+  @AppStorage(EnhancedTranscriptsStore.defaultsKey)
+  private var enhancedTranscripts = EnhancedTranscriptsStore.defaultValue
+
+  /// `@AppStorage` is the only writer of this slot (the store exposes no
+  /// setter); trimming lives on the read side (`CustomStyleStore.instructions`)
+  /// for the reasons on `KeyTermsStepView.text`. The length cap is enforced
+  /// here, though: the dictation API rejects the whole request over its
+  /// instruction limit, so text past `characterLimit` must never be storable.
+  @AppStorage(CustomStyleStore.defaultsKey) private var text = ""
+
+  var body: some View {
+    Section {
+      TextField(
+        text: $text,
+        prompt: Text("e.g. add fitting emojis sparingly, or always write in lowercase"),
+        axis: .vertical
+      ) {
+        Text("Custom Style")
+      }
+      .labelsHidden()
+      .lineLimit(2...6)
+      .font(.body)
+      .disableAutocorrection(true)
+      .accessibilityIdentifier(UITestIdentifiers.customStyleField)
+      .onChange(of: text) {
+        if text.utf8.count > CustomStyleStore.characterLimit {
+          text = text.prefix(maxUTF8Bytes: CustomStyleStore.characterLimit)
+        }
+      }
+      .disabled(!enhancedTranscripts)
+    } header: {
+      Text("Custom Style")
+    } footer: {
+      HStack(alignment: .top) {
+        Text(
+          enhancedTranscripts
+            ? "Style preferences applied when polishing each dictation — casing, tone, emoji use."
+            : "Style preferences need enhanced transcripts turned on.")
+        if enhancedTranscripts {
+          Spacer()
+          // The API caps the combined instruction, so the room left is finite —
+          // show it rather than truncating silently at the limit. Counted in
+          // UTF-8 bytes, the unit the limit is enforced in.
+          Text("\(text.utf8.count)/\(CustomStyleStore.characterLimit)")
+            .monospacedDigit()
+            .accessibilityLabel(
+              "\(text.utf8.count) of \(CustomStyleStore.characterLimit) characters used")
+        }
+      }
     }
   }
 }

@@ -45,8 +45,7 @@ import os
 /// app-specific terminology like `player state` through a variable application
 /// reference, so both players are unrolled into a single generated script.
 final class MediaPauseController {
-  private nonisolated static let logger = Logger(
-    subsystem: BlurtIdentity.subsystem, category: "MediaPauseController")
+  private nonisolated static let logger = HostIdentity.current.logger("MediaPauseController")
 
   /// Off-pool home for the `osascript` invocations. A Dispatch queue rather than
   /// `Task.detached`, for the same reason `DictationSession` uses one for the AX
@@ -62,7 +61,7 @@ final class MediaPauseController {
   /// see an empty `pausedPlayers` — leaving the music stopped, the one failure the
   /// user would actually notice.
   private static let queue = DispatchQueue(
-    label: "\(BlurtIdentity.subsystem).MediaPause", qos: .userInitiated)
+    label: "\(HostIdentity.current.subsystem).MediaPause", qos: .userInitiated)
 
   /// Shared with `CueSoundPlayer`'s gate — same edges, one implementation.
   private var edges = RecordingEdgeDetector()

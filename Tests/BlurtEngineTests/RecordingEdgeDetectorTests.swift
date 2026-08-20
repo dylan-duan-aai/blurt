@@ -63,6 +63,29 @@ struct RecordingEdgeDetectorTests {
     #expect(detector.edge(for: .failed(.apiKeyMissing)) == nil)
   }
 
+  @Test("the connecting phase doesn't fire an edge — .began waits for audio to flow")
+  func connectingIsNotAnEdge() {
+    // A press first claims `.connecting` while MicCapture's liveness gate waits for
+    // the input route to deliver frames (on Bluetooth, ~1-2 s). The edge must ride
+    // connecting→recording, not the press: pausing music or chiming at the press
+    // would fire while nothing is being captured yet, and on the pause side would
+    // mean resuming before the user has finished speaking.
+    var detector = RecordingEdgeDetector()
+    #expect(detector.edge(for: .connecting) == nil)
+    #expect(detector.edge(for: .recording) == .began)
+    #expect(detector.edge(for: .transcribing) == .ended)
+  }
+
+  @Test("a connect that never reaches recording reports no edges at all")
+  func abandonedConnectIsSilent() {
+    // The mic never opened, so there is nothing to have suppressed and nothing to
+    // restore — a spurious `.ended` here would resume music that was never paused.
+    var detector = RecordingEdgeDetector()
+    #expect(detector.edge(for: .connecting) == nil)
+    #expect(detector.edge(for: .failed(.apiKeyMissing)) == nil)
+    #expect(detector.edge(for: .idle) == nil)
+  }
+
   @Test("back-to-back dictations each get their own pair of edges")
   func consecutiveDictations() {
     var detector = RecordingEdgeDetector()

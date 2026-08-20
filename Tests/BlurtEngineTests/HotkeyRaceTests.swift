@@ -15,10 +15,12 @@ struct HotkeyRaceTests {
 
   @Test("release during mic.start is honored, not dropped")
   func releaseDuringStartIsHonored() async throws {
-    let mic = GatedMicCapture()
+    let mic = GatedStartMic()
     let stt = StubTranscriber(mode: .transcript("hi"))
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     let pressed = Task { await session.press() }
     await mic.waitUntilStartEntered()  // press() is now suspended inside mic.start()
@@ -38,10 +40,12 @@ struct HotkeyRaceTests {
 
   @Test("cancel during mic.start is honored, not dropped")
   func cancelDuringStartIsHonored() async throws {
-    let mic = GatedMicCapture()
+    let mic = GatedStartMic()
     let stt = StubTranscriber(mode: .transcript("hi"))
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     let pressed = Task { await session.press() }
     await mic.waitUntilStartEntered()  // press() is now suspended inside mic.start()
@@ -65,10 +69,12 @@ struct HotkeyRaceTests {
   /// — the mic must never be started twice.
   @Test("a second press during mic.start is dropped, not double-started")
   func secondPressDuringStartIsDropped() async throws {
-    let mic = GatedMicCapture()
+    let mic = GatedStartMic()
     let stt = StubTranscriber(mode: .transcript("hi"))
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     let pressed = Task { await session.press() }
     await mic.waitUntilStartEntered()  // first press() is suspended inside mic.start()
@@ -92,19 +98,24 @@ struct HotkeyRaceTests {
   /// transcribe→inject run.
   @Test("cancel overrides a pending release during mic.start")
   func cancelOverridesPendingReleaseDuringStart() async throws {
-    let mic = GatedMicCapture()
+    let mic = GatedStartMic()
     let stt = StubTranscriber(mode: .transcript("hi"))
     let injector = StubInjector()
-    let session = DictationSession(mic: mic, transcriber: stt, injector: injector)
+    let session = DictationSession(
+      mic: mic, transcriber: stt, injector: injector, keyTermsProvider: { [] },
+      seams: .offline)
 
     let pressed = Task { await session.press() }
     await mic.waitUntilStartEntered()
-    // Both queue behind the in-flight press. The drain lets cancel() record its
-    // request before the queued release runs, so the release deterministically
-    // consumes it after mic.stop() and spawns no pipeline.
+    // Both queue behind the in-flight press. Waiting until the cancel has
+    // *recorded* its request — the condition itself, rather than a fixed yield
+    // budget that drains this task and not the session — is what makes the rest
+    // deterministic: the queued release then consumes the request after
+    // mic.stop() and spawns no pipeline. Without it, a cancel whose first turn
+    // lands after the release's could let the transcript be pasted.
     let released = Task { await session.release() }
     let cancelled = Task { await session.cancel() }
-    for _ in 0..<1000 { await Task.yield() }
+    await session.awaitCancelRequest()
     await mic.allowStartToFinish()
     await pressed.value
     await released.value
@@ -115,28 +126,5 @@ struct HotkeyRaceTests {
     #expect(await session.phase == .cancelled)
     #expect(await mic.stopCalls == 1)
     #expect(await injector.inserted.isEmpty)
-  }
-}
-
-/// Mic stub whose `start()` blocks until the test releases it, so `release()` can
-/// be landed deterministically while `press()` is suspended inside `mic.start()`.
-/// The entry/finish choreography lives in the shared `Gate`.
-private actor GatedMicCapture: MicCaptureProtocol {
-  private(set) var startCalls = 0
-  private(set) var stopCalls = 0
-  private let gate = Gate()
-
-  func start() async throws {
-    startCalls += 1
-    await gate.enter()
-  }
-
-  func waitUntilStartEntered() async { await gate.waitUntilEntered() }
-  func allowStartToFinish() async { await gate.allowToFinish() }
-
-  func stop() async throws -> Data {
-    stopCalls += 1
-    // This suite exercises the press/release race, not the too-short guard.
-    return StubPCM.aboveMinimum
   }
 }

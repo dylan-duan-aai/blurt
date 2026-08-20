@@ -11,14 +11,20 @@ import Foundation
 ///
 /// **Browsers are deliberately not covered** — see `MediaPlayerApp` for the three
 /// detection routes that were measured and rejected, and for the blind media-key
-/// fallback that was built, tested, and removed. Don't add a switch for it back.
+/// fallback that was built, tested in real use, and removed. Don't add a switch for
+/// it back.
 ///
 /// The host reads this at the start of each dictation, so a change applies to the
 /// very next one. Same shape as `EnhancedTranscriptsStore` / `DeveloperModeStore`.
 public struct MediaPauseStore {
   /// UserDefaults key holding the switch. Public so SwiftUI views can observe it
   /// directly (e.g. `@AppStorage`) and re-render on change.
-  public static let defaultsKey = "BlurtPauseMediaWhileDictating"
+  public static var defaultsKey: String { DefaultsKey.pauseMedia.key }
+
+  /// The value an unset key reads as. Public so the Settings toggle's `@AppStorage`
+  /// default comes from here rather than restating `true` — the view and the pause
+  /// controller have to agree about the empty slot.
+  public static let defaultValue = true
 
   private let defaults: UserDefaults
 
@@ -31,12 +37,11 @@ public struct MediaPauseStore {
   /// `bool(forKey:)` shape (which reads a missing key as false), hence the
   /// presence check.
   ///
-  /// Public, unlike `EnhancedTranscriptsStore.isEnabled`: the consumer is the
-  /// app-side pause controller, not an engine type, so it reads the rule from here
-  /// rather than re-deriving "unset means on" against the raw key.
+  /// Read-only, like `EnhancedTranscriptsStore.isEnabled`: the Settings toggle
+  /// writes the slot through `@AppStorage`, so a setter here would have no
+  /// production caller.
   public var isEnabled: Bool {
-    get { defaults.object(forKey: Self.defaultsKey) as? Bool ?? true }
-    nonmutating set { defaults.set(newValue, forKey: Self.defaultsKey) }
+    defaults.object(forKey: Self.defaultsKey) as? Bool ?? Self.defaultValue
   }
 }
 
@@ -64,13 +69,18 @@ public struct MediaPauseStore {
 ///   processes without system-audio-recording consent — a far heavier permission
 ///   than the feature is worth, and worse UX than the automation prompt.
 /// - **MediaRemote** (`MRMediaRemoteGetNowPlayingApplicationIsPlaying`): private,
-///   and now gated — it returned `false` while Spotify was demonstrably playing.
+///   and now gated — it returned `false`, and `nowPlayingInfo` nil, while Spotify
+///   was demonstrably playing. Re-confirmed from a signed `.app` bundle, so
+///   bundling is not the missing piece.
 ///
 /// A blind system play/pause media key (the only thing that *reaches* a browser)
-/// was therefore built as an opt-in fallback, tested, and **removed**: with no way
-/// to check state it toggles rather than pauses, so it starts playback that wasn't
-/// running and desyncs on resume. That was confirmed in real use, not just in
-/// theory. Don't reintroduce it without a state source that actually works.
+/// was therefore built as an opt-in fallback, tested in real use, and **removed**:
+/// with no way to check state it toggles rather than pauses, so it started playback
+/// that wasn't running. The honest routes left are a browser extension with native
+/// messaging (precise, no user setup, but a product-sized lift) or
+/// `execute javascript` / `do JavaScript` (precise, but each browser needs "Allow
+/// JavaScript from Apple Events" enabled — verified blocked by default, Chromium
+/// error 12). Don't reintroduce a blind toggle.
 public enum MediaPlayerApp: String, CaseIterable, Sendable {
   /// The name the scripting interface is addressed by — also the name macOS shows
   /// in its "Blurt wants to control …" consent prompt.
